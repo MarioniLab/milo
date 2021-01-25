@@ -1,0 +1,201 @@
+---
+title: "Batch effect - mouse chimeras"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(MouseGastrulationData)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(bit64)
+
+source('~/milo/notebooks/benchmark/benchmark_utils.R')
+```
+
+### Load dataset
+
+Info from `MouseGastrulationAtlas` vignettes
+
+> T (Brachyury) knockout chimeras involving sixteen samples, from eight embryo pools at two timepoints. The injected cells in the T chimeras have knockouts for the T gene. They also contain the td-Tomato construct. 
+
+> They contain an extra feature for expression of the td-Tomato.
+Cells derived from the injected cells (and thus are positive for td-Tomato) are marked in the colData field tomato.
+Information for the proper pairing of samples from the same embryo pools can be found in the colData field pool.
+Spliced count matrices are not provided.
+
+
+```{r}
+tchim_sce <- TChimeraData(type="processed")
+wtchim_sce <- WTChimeraData(type="processed")
+
+## Keep E8.5 samples
+tchim_sce_e85 <- tchim_sce[,tchim_sce$stage == 'E8.5']
+tchim_sce_e85 <- tchim_sce_e85[,!is.na(rowSums(reducedDim(tchim_sce_e85, "pca.corrected.E8.5")))]
+wtchim_sce_e85 <- wtchim_sce[,wtchim_sce$stage == 'E8.5']
+wtchim_sce_e85 <- wtchim_sce_e85[,!is.na(rowSums(reducedDim(wtchim_sce_e85, "pca.corrected.E8.5")))]
+
+## Merge in one 
+plotReducedDim(wtchim_sce_e85, dimred = 'pca.corrected.E8.5')
+plotReducedDim(tchim_sce_e85, dimred = 'pca.corrected.E8.5')
+
+all(rownames(tchim_sce_e85) %in% rownames(wtchim_sce_e85))
+colData(tchim_sce_e85) <- colData(tchim_sce_e85)[colnames(colData(wtchim_sce_e85))]
+
+chim_sce_e85 <- cbind(wtchim_sce_e85, tchim_sce_e85)
+```
+
+Attempt to reproduce batch correction from https://github.com/MarioniLab/TChimeras2020/blob/master/7_batch_correct/batch_correct.Rmd 
+
+```{r}
+#ensure counts has columns names for the cells
+#match timepoints,samples to the count table
+#timepoint_order, sample_order should contain each sample/timepoint ONCE, in correct order for correction
+doBatchCorrect = function(counts, 
+                          timepoints, 
+                          samples, 
+                          timepoint_order = c("E6.5", "E6.75", "E7.0", "mixed_gastrulation", "E7.25", "E7.5", "E7.75", "E8.0", "E8.25", "E8.5"), 
+                          sample_order=NULL, 
+                          npc = 50,
+                          pc_override = NULL, 
+                          BPPARAM = SerialParam()){
+  require(scran)
+  require(irlba)
+  require(BiocParallel)
+  
+  #default: samples largest to smallest
+  if(is.null(sample_order)){
+    tab = table(samples)
+    sample_order = names(tab)[order(tab), decreasing = TRUE]
+  }
+  
+  #remove timepoints that are not present
+  timepoint_order = timepoint_order[timepoint_order %in% timepoints]
+  
+  if(!is.null(pc_override)){
+    pca = pc_override
+  } else {
+    pca = prcomp_irlba(t(counts), n = npc)$x
+    rownames(pca) = colnames(counts)
+  }
+  
+  if(length(unique(samples)) == 1){
+    return(pca)
+  }
+  
+  #create nested list
+  pc_list = lapply(unique(timepoints), function(tp){
+    sub_pc = pca[timepoints == tp, , drop = FALSE]
+    sub_samp = samples[timepoints == tp]
+    list = lapply(unique(sub_samp), function(samp){
+      sub_pc[sub_samp == samp, , drop = FALSE]
+    })
+    names(list) = unique(sub_samp)
+    return(list)
+  })
+  
+  names(pc_list) = unique(timepoints)
+  
+  #arrange to match timepoint order
+  pc_list = pc_list[order(match(names(pc_list), timepoint_order))]
+  pc_list = lapply(pc_list, function(x){
+    x[order(match(names(x), sample_order))]
+  })
+  
+  #perform corrections within list elements (i.e. within stages)
+  correct_list = lapply(pc_list, function(x){
+    if(length(x) > 1){
+      return(do.call(fastMNN, c(x, "pc.input" = TRUE, BPPARAM = BPPARAM))$corrected)
+    } else {
+      return(x[[1]])
+    }
+  })
+  
+  #perform correction over list
+  if(length(correct_list)>1){
+    correct = do.call(fastMNN, c(correct_list, "pc.input" = TRUE, BPPARAM = BPPARAM))$corrected
+  } else {
+    correct = correct_list[[1]]
+  }
+  
+  correct = correct[match(colnames(counts), rownames(correct)),]
+  
+  return(correct)
+  
+}
+
+## Get HVGs
+chim_sce_e85 <- logNormCounts(chim_sce_e85)
+dec <- modelGeneVar(chim_sce_e85)
+hvgs_E8.5 <- getTopHVGs(dec, n=5000)
+
+## Batch correct
+meta <- as_tibble(colData(chim_sce_e85))
+tab = table(meta$sample[meta$stage == "E8.5"])
+correct2 = doBatchCorrect(counts = logcounts(chim_sce_e85), 
+                          timepoints = meta$tomato[meta$stage == "E8.5"], 
+                          samples = meta$sample[meta$stage == "E8.5"], 
+                          timepoint_order = as.logical(c("TRUE", "FALSE")), 
+                          sample_order = as.numeric(names(tab[order(tab, decreasing = TRUE)])))
+
+```
+
+
+
+```{r, fig.height=10, fig.width=10}
+reducedDim(tchim_sce_e85, "PCA") <- reducedDim(tchim_sce_e85, "pca.corrected.E8.5")
+
+tchim_sce_e85 <- runUMAP(tchim_sce_e85, dimred="PCA")
+
+plot(
+    x = reducedDim(tchim_sce_e85, "UMAP")[,1],
+    y = reducedDim(tchim_sce_e85, "UMAP")[,2],
+    col = EmbryoCelltypeColours[tchim_sce_e85$celltype.mapped],
+    pch = 19,
+    xaxt = "n", yaxt = "n",
+    xlab = "UMAP1", ylab = "UMAP2"
+)
+
+
+```
+
+```{r, fig.height=7, fig.width=8}
+plotUMAP(tchim_sce_e85, colour_by="tomato", point_size=0.1) +
+  facet_wrap(colour_by~.)
+plotUMAP(tchim_sce_e85, colour_by="pool", point_size=0.1, text_by="celltype.mapped")
+```
+
+## Run Milo
+
+W/o controlling for technical covariate
+
+```{r}
+## Make design matrix
+
+sample_col = "sample"
+design_df <- as.tibble(colData(tchim_sce_e85)[c(sample_col, "tomato", "pool")]) %>%
+  distinct() %>%
+  column_to_rownames(sample_col)
+
+design <- formula("~ tomato")
+
+## Build graph neighbourhoods
+milo <- Milo(tchim_sce_e85)
+milo <- buildGraph(milo, k=k, d=d, reduced.dim = reduced.dim)
+milo <- makeNhoods(milo, prop = 0.1, k=15, d=30, reduced_dims = "pca.corrected.E8.5")
+
+plotNhoodSizeHist(milo)
+```
+```{r}
+## Test DA
+milo <- countCells(milo, meta.data = data.frame(colData(milo)), sample=sample_col)
+milo <- calcNhoodDistance(milo, d=30, reduced.dim = "pca.corrected.E8.5")
+DA_results <- testNhoods(milo, design = design, design.df = design_df)
+
+```
+```{r, fig.width=10, fig.height=9}
+milo <- buildNhoodGraph(milo)
+plotNhoodGraphDA(milo, DA_results, alpha = 0.1)
+```
+

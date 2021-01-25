@@ -6,7 +6,7 @@ library(miloR)
 library(tibble)
 library(dplyr)
 library(igraph)
-# library(cydar)
+library(cydar)
 
 ## Set-up reticulate 4 MELD
 reticulate::use_condaenv("emma_env", required=TRUE)
@@ -48,8 +48,9 @@ add_synthetic_labels <- function(sce, # SingleCellExperiment obj
                                  redDim='pca.corrected', # embedding to use to simulate differential abundance
                                  n_conditions=2, # number of conditions to simulate
                                  n_components=10, # number of components of embedding to use
-                                 seed=42
-){
+                                 n_replicates=3, # number of replicates per condition
+                                 n_batches = 2, # number of technical batches per condition (at least 2 replicates per batch)
+                                 seed=42){
   data_embedding = reducedDim(sce, redDim)[,1:n_components]
   set.seed(seed)
   # embedding data must be mean-centered
@@ -71,22 +72,52 @@ add_synthetic_labels <- function(sce, # SingleCellExperiment obj
   
   # Generate labels for condition and replicates
   synth_labels <- sapply(1:nrow(cond_probability),  function(i) sample(colnames(cond_probability), size = 1, prob = cond_probability[i,]))
-  synth_replicates <- rep(c("R1", "R2", "R3" ), 1000)
-  synth_samples <- paste0(synth_labels, "_", synth_replicates)
+  replicates <- paste0("R", 1:n_replicates)
+  batches <- paste0("B", rep(1:n_batches, n_replicates/n_batches))
+  names(batches) <- replicates
+  synth_samples <- paste0(synth_labels, "_", replicates)
+  synth_batches <- batches[str_remove(synth_samples, ".+_")]
   
   # Add synthetic labels and probabilities to colData
   colData(sce)[["synth_labels"]] <- synth_labels
   # colData(sce)[["synth_replicates"]] <- synth_replicates
   colData(sce)[["synth_samples"]] <- synth_samples
+  colData(sce)[["synth_batches"]] <- synth_batches
   colnames(cond_probability) <- paste0(colnames(cond_probability), "_prob")
   colData(sce)[colnames(cond_probability)] <- cond_probability
   return(sce)
 }
 
+## Group true DA cells in clusters (to test coverage of DA methods)
+cluster_synthetic_labels <- function(embryo_sce, graph, min_cl_size=5){
+  adj <- get.adjacency(graph)
+  
+  ## Retain DA cells
+  da.adj <- adj[embryo_sce$true_labels!='NotDA',embryo_sce$true_labels!='NotDA']
+  
+  ## REmove edges between cells with discodant LFC sign
+  da.cells.mat <- sapply(unique(embryo_sce$true_labels), function(x) as.numeric(embryo_sce$true_labels==x))
+  da.cells.mat <- da.cells.mat[embryo_sce$true_labels!='NotDA',c("NegLFC", "PosLFC")]
+  concord.sign.adj <- tcrossprod(da.cells.mat[,c("NegLFC", "PosLFC")], da.cells.mat[,c("NegLFC", "PosLFC")])
+  concord.sign.adj <- as(concord.sign.adj, 'sparseMatrix')
+  da.adj[concord.sign.adj==0] <- 0
+  
+  ## Cluster DA cells
+  da.graph <- graph_from_adjacency_matrix(da.adj, mode = 'undirected')
+  clust <- igraph::cluster_louvain(da.graph)
+  embryo_sce$true_DA_clust <- rep(NA, length(embryo_sce$true_labels))
+  embryo_sce$true_DA_clust[embryo_sce$true_labels != "NotDA"] <- clust$membership
+  
+  ## Remove singletons (or less than min_cl_size cells)
+  embryo_sce$true_DA_clust[embryo_sce$true_DA_clust %in% which(table(clust$membership) < min_cl_size)] <- NA
+  
+  embryo_sce
+}
+
 ### SYNTHETIC BATCH EFFECT ###
 
-add_batch_effect <- function(embryo_sce, norm_sd=0.5){
-  cellids_sample <- split(embryo_sce$cell, embryo_sce$synth_samples)
+add_batch_effect <- function(embryo_sce, batch_col="synth_samples", norm_sd=0.5){
+  cellids_sample <- split(embryo_sce$cell, embryo_sce[[batch_col]])
   X_pca <- reducedDim(embryo_sce, "pca.corrected")
   X_pca_batch <- X_pca
 
@@ -99,33 +130,29 @@ add_batch_effect <- function(embryo_sce, norm_sd=0.5){
   embryo_sce  
 }
 
-# ## Preprocessing/checking benchmarking input
-# 
-# prepare4bm <- function(){
-#   ## Save library size for cydar
-#   
-#   ## Make sure there is a cell_id column in colData
-#   
-# }
-
-
 ### METHODS ###
 
 ## Milo
 
 run_milo <- function(sce, condition_col, sample_col, reduced.dim="PCA",
-                     k=15, d=30, prop=0.1, returnMilo = TRUE){
+                     k=15, d=30, prop=0.1, returnMilo = TRUE,
+                     batch_col=NULL){
   ## Make design matrix
-  design_df <- as.tibble(colData(sce)[c(sample_col, condition_col)]) %>%
+  design_df <- as.tibble(colData(sce)[c(sample_col, condition_col, batch_col)]) %>%
     distinct() %>%
     column_to_rownames(sample_col)
-  design <- formula(paste('~', condition_col, collapse = ' '))
+  if (is.null(batch_col)) {
+    design <- formula(paste('~', condition_col, collapse = ' '))  
+  } else {
+    design <- formula(paste('~', batch_col, "+", condition_col, collapse = ' '))
+  }
+  
   ## Build graph neighbourhoods
   milo <- Milo(sce)
   milo <- buildGraph(milo, k=k, d=d, reduced.dim = reduced.dim)
   milo <- makeNhoods(milo, prop = prop, k=k, d=d, reduced_dims = reduced.dim)
   ## Test DA
-  milo <- countCells(milo, meta.data = data.frame(colData(milo)), sample=sample_col)
+  milo <- miloR::countCells(milo, meta.data = data.frame(colData(milo)), sample=sample_col)
   milo <- calcNhoodDistance(milo, d=d, reduced.dim = reduced.dim)
   DA_results <- testNhoods(milo, design = design, design.df = design_df)
   if (isTRUE(returnMilo)) {
@@ -292,6 +319,9 @@ benchmark_da <- function(sce, condition_col='synth_labels',
   bm <- data.frame(milo=milo_out, daseq=daseq_out, meld=meld_out, louvain=louvain_out)
   bm$true_prob <- sce$Condition2_prob 
   bm$true <- sce$true_labels
+  if (!is.null(sce$true_DA_clust)) {
+    bm$true_clust <- sce$true_DA_clust
+  }
   long_bm <- pivot_longer(bm, cols = c(milo, daseq, meld, louvain), names_to='method', values_to="pred") 
   return(long_bm)
 }
@@ -306,9 +336,9 @@ calculate_outcome <- function(long_bm){
     group_by(method, outcome) %>%
     summarise(n=n()) %>%
     pivot_wider(id_cols=method, names_from=outcome, values_from=n, values_fill=0) %>%
-    mutate(TPR=TP/(TP+FP), FPR=FP/(TP+FP), TNR=TN/(TN+FN), 
-           Accuracy = (TP + TN)/(TP + TN + FP + FN),
-           Recall = TP / (TP+FN)
+    mutate(TPR=TP/(TP+FP), FPR=FP/(TP+FP), TNR=TN/(TN+FN), FNR = FN/(FN+TP),
+           Power = 1 - FNR,
+           Accuracy = (TP + TN)/(TP + TN + FP + FN)
     )
 }
 

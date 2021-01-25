@@ -52,16 +52,18 @@ bm_params = list(
   louvain = list(k=15)
   )
 
-print("Running DA methods...")
-bm_ls <- lapply(bm_sce_ls, function(x){
-  long_bm <- benchmark_da(x, out_type = "labels", red_dim = "pca_batch", d=30, params = bm_params)
-  mutate(long_bm, batch_sd=x$norm_sd[1])
-})
-
-print("Saving outputs...")
-outname <- str_c("/nfs/team205/ed6/data/milo_benchmark/benchmarkBatch_embryo_labels", seed, ".csv")
+print("Saving params...")
 outname_params <- str_c("/nfs/team205/ed6/data/milo_benchmark/benchmarkBatch_embryo_labels", seed, "_params.RDS")
-
-purrr::reduce(long_bm, bind_rows) %>%
-  write_csv(outname)
 saveRDS(bm_params, outname_params)
+
+print("Running DA methods...")
+i_bm = 1
+for (x in bm_sce_ls){
+  long_bm <- benchmark_da(x, out_type = "labels", red_dim = "pca_batch", d=30, params = bm_params)
+  long_bm <- mutate(long_bm, batch_sd=x$norm_sd[1])
+  outname <- str_c("/nfs/team205/ed6/data/milo_benchmark/benchmarkBatch_embryo_labels", seed, "_batchEffect", i_bm, ".csv")
+  write_csv(long_bm, outname)
+  i_bm = i_bm + 1 
+}
+
+
