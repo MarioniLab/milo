@@ -60,7 +60,7 @@ embryo_sce <- scater::runUMAP(embryo_sce, dimred="pca.corrected")
 
 ```{r, fig.height=10, fig.width=10}
 singlets <- which(!(colData(embryo_sce)$doublet | colData(embryo_sce)$stripped))
-plotReducedDim(embryo_sce, "UMAP", colour_by="celltype")
+plotReducedDim(embryo_sce, "UMAP", colour_by="celltype", point_size=0.1)
 ```
 
 Save object 4 benchmark
@@ -69,39 +69,51 @@ Save object 4 benchmark
 saveRDS(embryo_sce, "/nfs/team205/ed6/data/milo_benchmark/embryo_data_bm.RDS")
 ```
 
+## Simulate ONE DA region
+
+Fuzzy clustering
+```{r, fig.height=7, fig.width=7}
+embryo_sce <- add_synthetic_labels_pop(embryo_sce, pop = "Epiblast", pop_col="celltype", pop_enr = 0.8)
+
+# embryo_sce$cl_w <- apply(enr_prob, 1, function(x) x[which.max(abs(x - 0.5))])
+plotUMAP(embryo_sce, colour_by="Condition1_prob", point_size=0.1)
+plotUMAP(embryo_sce, colour_by="synth_labels", point_size=0.01)  + facet_wrap(colour_by~.)
+```
+
 ## Try one method at the time (to pick params)
 
-```{r}
-embryo_sce <- readRDS("/nfs/team205/ed6/data/milo_benchmark/embryo_data_bm.RDS")
+<!-- ```{r} -->
+<!-- embryo_sce <- readRDS("/nfs/team205/ed6/data/milo_benchmark/embryo_data_bm.RDS") -->
 
-# Build KNN graph for smoothing
-X_red_dim = reducedDim(embryo_sce, "pca.corrected")[,1:30]
-graph = buildKNNGraph(t(X_red_dim), k = 15)  
+<!-- # Build KNN graph for smoothing -->
+<!-- X_red_dim = reducedDim(embryo_sce, "pca.corrected")[,1:30] -->
+<!-- graph = buildKNNGraph(t(X_red_dim), k = 15)   -->
 
-## Simulate labels
-seed=2022
-embryo_sce <- add_synthetic_labels(embryo_sce, 
-                                   n_components = 10,  
-                                   redDim='pca.corrected', 
-                                   seed=seed, 
-                                   knn_graph = graph, 
-                                   n_replicates = 6)
-true_labels <- ifelse(embryo_sce$Condition2_prob < 0.4, "NegLFC", ifelse(embryo_sce$Condition2_prob > 0.6, "PosLFC", "NotDA"))
-colData(embryo_sce)[["true_labels"]] <- true_labels
+<!-- ## Simulate labels -->
+<!-- seed=2022 -->
+<!-- embryo_sce <- add_synthetic_labels(embryo_sce,  -->
+<!--                                    n_components = 10,   -->
+<!--                                    redDim='pca.corrected',  -->
+<!--                                    seed=seed,  -->
+<!--                                    knn_graph = graph,  -->
+<!--                                    n_replicates = 6) -->
+<!-- true_labels <- ifelse(embryo_sce$Condition2_prob < 0.4, "NegLFC", ifelse(embryo_sce$Condition2_prob > 0.6, "PosLFC", "NotDA")) -->
+<!-- colData(embryo_sce)[["true_labels"]] <- true_labels -->
 
-embryo_sce <- runUMAP(embryo_sce, dimred="pca.corrected", name = 'UMAP', n_dimred=1:30)
-```
+<!-- embryo_sce <- runUMAP(embryo_sce, dimred="pca.corrected", name = 'UMAP', n_dimred=1:30) -->
+<!-- ``` -->
 
-Divide cells into true affected subpopulations: take KNN adjacency matrix, filter out edges between cells with different label, then do louvain_clustering at high res
 
-```{r}
+<!-- Divide cells into true affected subpopulations: take KNN adjacency matrix, filter out edges between cells with different label, then do louvain_clustering at high res -->
 
-embryo_sce <- cluster_synthetic_labels(embryo_sce, graph)
-plotReducedDim(embryo_sce, dimred="UMAP", colour_by="true_labels", point_size=0.2) 
-plotReducedDim(embryo_sce, dimred="UMAP", colour_by="true_DA_clust", 
-               text_by="true_DA_clust", 
-               point_size=0.2) 
-```
+<!-- ```{r} -->
+
+<!-- embryo_sce <- cluster_synthetic_labels(embryo_sce, graph) -->
+<!-- plotReducedDim(embryo_sce, dimred="UMAP", colour_by="true_labels", point_size=0.2)  -->
+<!-- plotReducedDim(embryo_sce, dimred="UMAP", colour_by="true_DA_clust",  -->
+<!--                text_by="true_DA_clust",  -->
+<!--                point_size=0.2)  -->
+<!-- ``` -->
 
 ```{r}
 library(cydar)
@@ -131,7 +143,7 @@ run_cydar <- function(sce, condition_col="synth_labels",
   processed.exprs <- lapply(sample_ls, function(s) reducedDim(sce[,s], "pca.corrected")[,1:d])
   cd <- prepareCellData(processed.exprs)
   ## Count cells in hyperspheres
-  cd <- countCells(cd, tol=r, filter=0, downsample=10)
+  cd <- countCells(cd, tol=r, filter=20, downsample=10)
   # do DA testing with edgeR
   cd.dge <- DGEList(assay(cd), lib.size=cd$totals)
   
@@ -171,10 +183,6 @@ cydar2output <- function(cd, da_res, out_type="continuous", alpha=0.1){
   da.cell
 }
 
-
-nhs <- lapply(cellAssignments(cd), function(hs) as.vector(hs))
-hs_mat <- sapply(nhs, function(nh) ifelse(1:max(unlist(cellAssignments(cd))) %in% nh, 1, 0))
-
 cydar_res <- run_cydar(embryo_sce)
 cydar_out <- cydar2output(cydar_res$Cd, cydar_res$DAres, out_type = "labels")
 hist(cydar_res$DAres$logFC)
@@ -189,19 +197,12 @@ milo_out <- run_milo(embryo_sce, condition_col="synth_labels", sample_col="synth
 
 milo_out$Milo <- buildNhoodGraph(milo_out$Milo)
 embryo_sce$milo_res <- milo2output(milo_out$Milo, milo_out$DAres, out_type = "labels")
+true_labels <- ifelse(embryo_sce$Condition2_prob < 0.4, "NegLFC", ifelse(embryo_sce$Condition2_prob > 0.6, "PosLFC", "NotDA"))
+colData(embryo_sce)[["true_labels"]] <- true_labels
 
 plotReducedDim(embryo_sce, dimred="UMAP", colour_by="milo_res", point_size=0.2) 
+plotReducedDim(embryo_sce, dimred="UMAP", colour_by="Condition2_prob", point_size=0.2) 
 plotReducedDim(embryo_sce, dimred="UMAP", colour_by="true_labels", point_size=0.2) 
-```
-
-How many subpopulations were detected?
-```{r}
-data.frame(colData(embryo_sce)[c('true_labels', "true_DA_clust", "milo_res")]) %>%
-  mutate(TP= ifelse(true_labels==milo_res & milo_res!="NotDA", 1, 0)) %>%
-  mutate(total_TPR = sum(TP)/sum(!is.na(true_DA_clust))) %>%
-  group_by(true_DA_clust) %>%
-  summarise(TPR=sum(TP)/n(), total_TPR=first(total_TPR)) %>%
-  ggplot(aes(as.factor(true_DA_clust), TPR)) + geom_col()
 ```
 
 Compare with MELD
@@ -215,41 +216,22 @@ embryo_sce$meld_res <- meld2output(meld_out, out_type = "labels")
 plotReducedDim(embryo_sce, dimred="UMAP", colour_by="meld_res", point_size=0.2) 
 plotReducedDim(embryo_sce, dimred="UMAP", colour_by="true_labels", point_size=0.2) 
 ```
-How many subpopulations were detected?
-```{r}
-data.frame(colData(embryo_sce)[c('true_labels', "true_DA_clust", "meld_res", "milo_res")]) %>%
-  mutate(meld_res=as.character(meld_res)) %>%
-  mutate(meld_res=case_when(meld_res=="PosLFC" ~ "NegLFC",
-                        meld_res=="NegLFC" ~ "PosLFC",
-                        TRUE ~ meld_res)) %>%
-  pivot_longer(cols = c("milo_res", "meld_res"), names_to="method", values_to="pred") %>%
-  mutate(TP= ifelse(true_labels==pred & pred!="NotDA", 1, 0)) %>%
-  group_by(method) %>%
-  summarise(TPR_total=sum(TP)/n()) %>%
-  ungroup() %>%
-  group_by(method, true_DA_clust) %>%
-  summarise(TPR=sum(TP)/n()) %>%
-  ggplot(aes(x=method,  TPR)) +
-  geom_boxplot() +
-  geom_point(size=2) +
-  geom_line(aes(group=as.factor(true_DA_clust)))
-```
 
-Does the prop/k need to reach saturation?
+<!-- Does the prop/k need to reach saturation? -->
 
-```{r}
-milo_ls <- lapply(seq(20,50, by = 10), function(k){
-  m <- buildGraph(Milo(embryo_sce), k=k, d=30, reduced.dim = 'pca.corrected') 
-  m <-  makeNhoods(m, prop = 0.1, k=k, d=30, reduced_dims = 'pca.corrected') 
-  m
-  })
+<!-- ```{r} -->
+<!-- milo_ls <- lapply(seq(20,50, by = 10), function(k){ -->
+<!--   m <- buildGraph(Milo(embryo_sce), k=k, d=30, reduced.dim = 'pca.corrected')  -->
+<!--   m <-  makeNhoods(m, prop = 0.1, k=k, d=30, reduced_dims = 'pca.corrected')  -->
+<!--   m -->
+<!--   }) -->
 
-names(milo_ls) <- seq(20,50, by = 10)
-imap(milo_ls, ~ data.frame( n_nhoods = rowSums(.x@nhoods), k=.y) ) %>%
-  purrr::reduce(bind_rows) %>%
-  ggplot(aes(fill=k, n_nhoods)) + geom_histogram(bins=50, position="identity")
+<!-- names(milo_ls) <- seq(20,50, by = 10) -->
+<!-- imap(milo_ls, ~ data.frame( n_nhoods = rowSums(.x@nhoods), k=.y) ) %>% -->
+<!--   purrr::reduce(bind_rows) %>% -->
+<!--   ggplot(aes(fill=k, n_nhoods)) + geom_histogram(bins=50, position="identity") -->
 
-```
+<!-- ``` -->
 
 ```{r}
 ## Make design matrix
@@ -341,6 +323,13 @@ lapply(meld_res_ls)
     )
 ```
 
+```{r}
+sce <- embryo_sce[,1:5000]
+
+daseq_res <- run_daseq(sce, condition_col="synth_labels", k.vec = c(10,20,30))
+
+hist(daseq_res$da.ratio)
+```
 
 
 ## + Batch effect 
@@ -355,7 +344,7 @@ embryo_sce <- readRDS("/nfs/team205/ed6/data/milo_benchmark/embryo_data_bm.RDS")
 X_red_dim = reducedDim(embryo_sce, "pca.corrected")[,1:30]
 graph = buildKNNGraph(t(X_red_dim), k = 15)  
 
-seed=2021
+seed=2024
 embryo_sce <- add_synthetic_labels(embryo_sce, 
                                    n_components = 10,  
                                    redDim='pca.corrected', 
@@ -387,23 +376,20 @@ Load results from `run_batch_benchmark.R`
 ```{r}
 outdir <- "/nfs/team205/ed6/data/milo_benchmark/"
 
-## Calculate evaluation metrics
-bm_outcome <- lapply(list.files(outdir, pattern = '.csv', full.names = TRUE), function(x) read_csv(x)) %>%
+df <- lapply(list.files(outdir, pattern = 'pop_size1000.+2030.+.csv', full.names = TRUE), function(x) read_csv(x)) %>%
   purrr::reduce(bind_rows) %>%
   ## Flip results for DAseq and MELD
-  mutate(pred=case_when(method %in% c("meld", "daseq") & pred=="PosLFC" ~ "NegLFC",
-                        method %in% c("meld", "daseq") & pred=="NegLFC" ~ "PosLFC",
-                        TRUE ~ pred)) %>%
+  mutate(pred=case_when(method %in% c("meld", 'daseq') & pred=="PosLFC" ~ "NegLFC",
+                        method %in% c("meld", 'daseq') & pred=="NegLFC" ~ "PosLFC",
+                        TRUE ~ pred))
+
+## Calculate evaluation metrics
+bm_outcome <- df %>%
   mutate(method=str_c(method, "_",batch_sd)) %>%
   calculate_outcome()
 
 bm_confusion <-
-  lapply(list.files(outdir, pattern = '.csv', full.names = TRUE), function(x) read_csv(x)) %>%
-  purrr::reduce(bind_rows) %>%
-  ## Flip results for DAseq and MELD
-  mutate(pred=case_when(method %in% c("meld", "daseq") & pred=="PosLFC" ~ "NegLFC",
-                        method %in% c("meld", "daseq") & pred=="NegLFC" ~ "PosLFC",
-                        TRUE ~ pred)) %>%
+  df %>%
   group_by(method, batch_sd, pred, true) %>%
   summarise(count=n())
 
@@ -414,9 +400,23 @@ bm_confusion %>%
   scale_fill_viridis_c()
 ```
 
+Visualize results on UMAP
+
+```{r}
+
+for (m in unique(df$method)){
+  embryo_sce$true_labels <- df[df$method==m & df$batch_sd==0,][["true"]]
+  embryo_sce$pred_labels <- df[df$method==m & df$batch_sd==0,][["pred"]]
+  embryo_sce$true_clust <- df[df$method==m & df$batch_sd==0,][["true_clust"]]
+  print(plotReducedDim(embryo_sce, dimred="UMAP", colour_by="pred_labels", point_size=0.2) + ggtitle(m)) 
+}
+
+# print(plotReducedDim(embryo_sce, dimred="UMAP", colour_by="true_clust", text_by="true_clust", point_size=0.2) )
+print(plotReducedDim(embryo_sce, dimred="UMAP", colour_by="true_labels", point_size=0.2) )
+```
 
 ```{r, fig.width=10, fig.height=8, warning=FALSE}
-pl_ls <- lapply(c("TPR", "FPR", "Accuracy", "Power"), function(metric){
+pl_ls <- lapply(c("TPR", "FPR", "FNR", "TNR", "Accuracy", "Power"), function(metric){
   bm_outcome %>%
   separate(col = "method", into = c("method", "be_sd"), sep = "_") %>%
   rename(metric=metric) %>%
@@ -425,110 +425,116 @@ pl_ls <- lapply(c("TPR", "FPR", "Accuracy", "Power"), function(metric){
   geom_line() +
   ylab(metric) +
   xlab('batch effect SD') +
-  theme_bw(base_size = 18)
+  theme_bw(base_size = 18) +
+    ylim(0,1)
  
 })
 
-wrap_plots(pl_ls, nrow=2, ncol=2, guides="collect")
+wrap_plots(pl_ls, nrow=3, ncol=2, guides="collect")
+```
+```{r}
+outdir <- "/nfs/team205/ed6/data/milo_benchmark/"
+
+df <- lapply(list.files(outdir, pattern = 'pop_size800.+2031.+.csv', full.names = TRUE), function(x) read_csv(x)) %>%
+  purrr::reduce(bind_rows) %>%
+  ## Flip results for DAseq and MELD
+  mutate(pred=case_when(method %in% c("meld", 'daseq') & pred=="PosLFC" ~ "NegLFC",
+                        method %in% c("meld", 'daseq') & pred=="NegLFC" ~ "PosLFC",
+                        TRUE ~ pred))
+
+## Calculate evaluation metrics
+bm_outcome <- df %>%
+  mutate(method=str_c(method, "_",batch_sd)) %>%
+  calculate_outcome()
+
+bm_confusion <-
+  df %>%
+  group_by(method, batch_sd, pred, true) %>%
+  summarise(count=n())
+
+bm_confusion %>%
+  ggplot(aes(pred, true, fill=log(count))) +
+  geom_tile() +
+  facet_grid(method ~ batch_sd) +
+  scale_fill_viridis_c()
+```
+
+Visualize results on UMAP
+
+```{r}
+
+for (m in unique(df$method)){
+  embryo_sce$true_labels <- df[df$method==m & df$batch_sd==0,][["true"]]
+  embryo_sce$pred_labels <- df[df$method==m & df$batch_sd==0,][["pred"]]
+  embryo_sce$true_clust <- df[df$method==m & df$batch_sd==0,][["true_clust"]]
+  print(plotReducedDim(embryo_sce, dimred="UMAP", colour_by="pred_labels", point_size=0.2) + ggtitle(m)) 
+}
+
+# print(plotReducedDim(embryo_sce, dimred="UMAP", colour_by="true_clust", text_by="true_clust", point_size=0.2) )
+print(plotReducedDim(embryo_sce, dimred="UMAP", colour_by="true_labels", point_size=0.2) )
+```
+
+```{r, fig.width=10, fig.height=8, warning=FALSE}
+pl_ls <- lapply(c("TPR", "FPR", "FNR", "TNR", "Accuracy", "Power"), function(metric){
+  bm_outcome %>%
+  separate(col = "method", into = c("method", "be_sd"), sep = "_") %>%
+  rename(metric=metric) %>%
+  ggplot(aes(as.numeric(be_sd), metric, color=method)) +
+  geom_point(size=3) +
+  geom_line() +
+  ylab(metric) +
+  xlab('batch effect SD') +
+  theme_bw(base_size = 18) +
+    ylim(0,1)
+ 
+})
+
+wrap_plots(pl_ls, nrow=3, ncol=2, guides="collect")
 ```
 
 ## Simulate batch effects with decent design 
 
-More than 1 sample per batch
+<!-- More than 1 sample per batch -->
 
 ```{r}
-seed=2022
-embryo_sce <- add_synthetic_labels(embryo_sce, 
-                                   n_components = 10,  
-                                   redDim='pca.corrected', 
-                                   seed=seed, 
-                                   knn_graph = graph, 
-                                   n_replicates = 6)
-true_labels <- ifelse(embryo_sce$Condition2_prob < 0.4, "NegLFC", ifelse(embryo_sce$Condition2_prob > 0.6, "PosLFC", "NotDA"))
-colData(embryo_sce)[["true_labels"]] <- true_labels
+seed=2031
+max_size=1000
+
+sized_pops = names(table(sce$celltype))[table(sce$celltype) < max_size]
+pop = sample(sized_pops, 1)
+
+sce <- add_synthetic_labels_pop(sce, pop=pop, pop_column = "celltype", seed=seed, pop_enr=0.8)
+true_labels <- ifelse(sce$Condition2_prob < 0.4, "NegLFC", ifelse(sce$Condition2_prob > 0.6, "PosLFC", "NotDA"))
+colData(sce)[["true_labels"]] <- true_labels
 
 ## Simulate batch effects of different magnitude
-bm_sce_ls <- lapply(c(0, 0.1, 0.3, 0.5, 0.7, 1), function(sd){
-  sce_be <- add_batch_effect(embryo_sce, batch_col = "synth_batches", norm_sd=sd)
+set.seed(seed)
+print("Simulating batch effects...")
+bm_sce_ls <- lapply(c(0, 0.25, 0.75, 1), function(sd){
+  sce_be <- add_batch_effect(sce, batch_col = "synth_batches", norm_sd=sd)
   sce_be$norm_sd <- sd
   sce_be
-  })
+})
 
 bm_sce_ls <- lapply(bm_sce_ls, function(x) runUMAP(x, dimred="pca_batch", name = 'umap_batch', n_dimred=1:30))
 
-lapply(bm_sce_ls, function(x) plotReducedDim(x, dimred="umap_batch", colour_by="synth_batches", point_size=0.2) + 
+lapply(bm_sce_ls, function(x) plotReducedDim(x, dimred="umap_batch", colour_by="synth_batches", point_size=0.2) +
          ggtitle(paste0("Batch effect SD = ", x$norm_sd[1])))
 ```
-
 ```{r}
-lapply(bm_sce_ls, function(x) plotReducedDim(x, dimred="umap_batch", colour_by="true_labels", point_size=0.2) + 
-         ggtitle(paste0("Batch effect SD = ", x$norm_sd[1])))
-```
-
-Load results from `run_batch_benchmark.R`
-```{r}
-outdir <- "/nfs/team205/ed6/data/milo_benchmark/"
-bm_out <- lapply(list.files(outdir, pattern = '2023.+.csv', full.names = TRUE), function(x) read_csv(x)) %>%
-  purrr::reduce(bind_rows)
-
-embryo_sce$milo_res = bm_out[bm_out$batch_sd==0 & bm_out$method=="milo",][["pred"]]
-embryo_sce$meld_res = bm_out[bm_out$batch_sd==0 & bm_out$method=="meld",][["pred"]]
-embryo_sce$daseq_res = bm_out[bm_out$batch_sd==0 & bm_out$method=="daseq",][["pred"]]
-embryo_sce$louvain_res = bm_out[bm_out$batch_sd==0 & bm_out$method=="louvain",][["pred"]]
-embryo_sce$true = bm_out[bm_out$batch_sd==0 & bm_out$method=="louvain",][["true"]]
-
-plotReducedDim(embryo_sce, dimred="umap_batch", colour_by="milo_res", point_size=0.2) 
-plotReducedDim(embryo_sce, dimred="umap_batch", colour_by="meld_res", point_size=0.2) 
-plotReducedDim(embryo_sce, dimred="umap_batch", colour_by="daseq_res", point_size=0.2) 
-plotReducedDim(embryo_sce, dimred="umap_batch", colour_by="true", point_size=0.2) 
-
-plotReducedDim(embryo_sce, dimred="pca_batch", colour_by="Condition1_prob", point_size=0.2) 
-```
-
-
-```{r}
-## Calculate evaluation metrics
-bm_outcome <- bm_out %>%
-  ## Flip results for DAseq and MELD
-  mutate(pred=case_when(method %in% c("meld", "daseq") & pred=="PosLFC" ~ "NegLFC",
-                        method %in% c("meld", "daseq") & pred=="NegLFC" ~ "PosLFC",
-                        TRUE ~ pred)) %>%
-  mutate(method=str_c(method, "_",batch_sd)) %>%
-  calculate_outcome()
-
-bm_confusion <-
-  lapply(list.files(outdir, pattern = '2023.+.csv', full.names = TRUE), function(x) read_csv(x)) %>%
-  purrr::reduce(bind_rows) %>%
-  ## Flip results for DAseq and MEL, 'daseq'
-  mutate(pred=case_when(method %in% c("meld", 'daseq') & pred=="PosLFC" ~ "NegLFC",
-                        method %in% c("meld", 'daseq') & pred=="NegLFC" ~ "PosLFC",
-                        TRUE ~ pred)) %>%
-  group_by(method, batch_sd, pred, true) %>%
-  summarise(count=n())
-
-bm_confusion %>%
-  ggplot(aes(pred, true, fill=log(count))) +
+data.frame(colData(bm_sce_ls[[1]])[c("synth_labels", "synth_samples", "synth_batches")]) %>%
+  distinct() %>%
+  ggplot(aes(synth_batches, synth_samples)) +
   geom_tile() +
-  facet_grid(method ~ batch_sd) +
-  scale_fill_viridis_c()
+data.frame(colData(bm_sce_ls[[1]])[c("synth_labels", "synth_samples", "synth_batches")]) %>%
+  distinct() %>%
+  ggplot(aes(synth_labels, synth_samples)) +
+  geom_tile()
 ```
 
-
-```{r, fig.width=10, fig.height=8, warning=FALSE}
-pl_ls <- lapply(c("TPR", "FPR", "Power", "Accuracy"), function(metric){
-  bm_outcome %>%
-  separate(col = "method", into = c("method", "be_sd"), sep = "_") %>%
-  rename(metric=metric) %>%
-  ggplot(aes(as.numeric(be_sd), metric, color=method)) +
-  geom_point(size=3) +
-  geom_line() +
-  ylab(metric) +
-  xlab('batch effect SD') +
-  theme_bw(base_size = 18)
- 
-})
-
-wrap_plots(pl_ls, nrow=2, ncol=2, guides="collect")
+```{r}
+lapply(bm_sce_ls, function(x) plotReducedDim(x, dimred="umap_batch", colour_by="Condition1_prob", point_size=0.2) +
+         ggtitle(paste0("Batch effect SD = ", x$norm_sd[1])))
 ```
 
 Try Milo with technical covariate in design
@@ -562,7 +568,7 @@ purrr::reduce(milo_res_ls, bind_rows) %>%
   mutate(method=str_c(method, "_",batch_sd)) %>%
   calculate_outcome() %>%
   separate(col = "method", into = c("method", "be_sd"), sep = "_") %>%
-  ggplot(aes(as.numeric(be_sd), Recall, color=method)) +
+  ggplot(aes(as.numeric(be_sd), Power, color=method)) +
   geom_point(size=3) +
   geom_line() +
   xlab('batch effect SD') +
