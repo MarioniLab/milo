@@ -34,6 +34,9 @@ library(RColorBrewer)
 library(pheatmap)
 library(DAseq)
 library(cydar)
+library(dplyr)
+library(tidyr)
+library(scico)
 ```
 
 I'll use the simple linear trajectory data set for this with ~2000 cells and genuinely DA regions.
@@ -41,10 +44,11 @@ I'll use the simple linear trajectory data set for this with ~2000 cells and gen
 ```{r, warning=FALSE, message=FALSE}
 n.dim <- 15
 k <- 10
-sim.data <- readRDS("~/Dropbox/Milo/simulations/data/Trajectory_Ncells2000_3M1DARep100_simpleSim.RDS")
+sim.data <- readRDS("~/Dropbox/Milo/simulations/data/Trajectory_Ncells2000_3M1DARep15_simpleSim.RDS")
 sim.mylo <- sim.data$mylo
 sim.meta <- sim.data$meta
-sim.mylo <- buildGraph(sim.mylo, k=k, d=n.dim, seed=42)
+nhoodAdjacency(sim.mylo) <- matrix(0L, ncol=1, nrow=1)
+sim.mylo <- buildGraph(sim.mylo, k=k, d=n.dim)
 sim.mylo
 ```
 
@@ -97,13 +101,14 @@ ggsave("~/Dropbox/Milo/figures/MethodCompare_simulation_bar.pdf",
 
 ```{r, warning=FALSE}
 set.seed(42)
-sim.mylo <- buildGraph(sim.mylo, k=k, d=n.dim, seed=42)
+sim.mylo <- buildGraph(sim.mylo, k=k, d=n.dim)
 test.meta <- data.frame("Condition"=c(rep("A", 3), rep("B", 3)),
                         "Replicate"=rep(c("R1", "R2", "R3"), 2))
 test.meta$Sample <- paste(test.meta$Condition, test.meta$Replicate, sep="_")
 rownames(test.meta) <- test.meta$Sample
 
 sim.mylo <- makeNhoods(sim.mylo, k=k, d=n.dim, prop=0.3, refined=TRUE)
+sim.mylo <- calcNhoodDistance(sim.mylo, d=n.dim)
 sim.mylo <- miloR::countCells(sim.mylo, samples="Sample", meta.data=as.data.frame(sim.meta))
 mylo.res <- testNhoods(sim.mylo, design=~Condition, design.df=test.meta[colnames(nhoodCounts(sim.mylo)), ])
 mylo.res$Diff <- sign(mylo.res$logFC)
@@ -195,14 +200,18 @@ str(sim.daseq[1:4])
 ```
 
 ```{r, warning=FALSE, fig.height=4.15, fig.width=5.15}
+pdf("~/Dropbox/Milo/figures/MethodCompare_DAseq_pred.pdf", height=4.15, width=5.15, useDingbats=FALSE)
 sim.daseq$pred.plot
+dev.off()
 ```
 
 This plot shows what `DAseq` predicts as being as the DA cells, i.e. different between conditions A and B. By default the DA cells are selected in 
 the top and bottom 5% of quantiles - I'll keep this as it will select the best 10% overall.
 
 ```{r, warning=FALSE, fig.height=4.15, fig.width=5.15}
+pdf("~/Dropbox/Milo/figures/MethodCompare_DAseq_DAcells.pdf", height=4.15, width=5.15, useDingbats=FALSE)
 sim.daseq$da.cells.plot
+dev.off()
 ```
 
 These top 10% of DA cells are specifically highlighted here. The DA regions are identified by grouping the coherently DA cells together by `DAseq`.
@@ -223,7 +232,9 @@ str(sim.da_regions[1:2])
 `DAseq` has clustered the DA cells into `r length(unique(sim.da_regions$da.region.label))` DA regions.
 
 ```{r, fig.height=4.15, fig.width=5.15}
+pdf("~/Dropbox/Milo/figures/MethodCompare_DAseq_DAregions.pdf", height=4.15, width=5.15, useDingbats=FALSE)
 sim.da_regions$da.region.plot
+dev.off()
 ```
 
 # Clustering - Louvain & Walktrap
@@ -447,8 +458,7 @@ ggsave("~/Dropbox/Milo/figures/MethodCompare_Power.pdf",
        height=3.95, width=4.25, useDingbats=FALSE)
 ```
 
-Let's visualise these in a single table/matrix. I have to split this into the measures where higher is better and 
-lower is better.
+Let's visualise these in a single table/matrix. I have to split this into the measures where higher is better and lower is better.
 
 ```{r, warning=FALSE, message=FALSE}
 # calculate the rank along each column
@@ -456,11 +466,13 @@ da.negrank.df <- as.data.frame(apply(da.fdr.df[, c("Power", "F1", "TNR", "TPR", 
                                      2, FUN=function(X) rank(-X)))
 da.negrank.df$Method <- da.fdr.df$Method
 da.negrank.melt <- melt(da.negrank.df, id.vars=c("Method"))
-da.negrank.melt$value <- ordered(da.negrank.melt$value,
-                                 levels=c(1:5))
+da.negrank.melt$value <- ordered(da.negrank.melt$value)
 
-rank.cols <- colorRampPalette(pal_futurama()(3))(5)
-names(rank.cols) <- c(1:5)
+rank.cols <- rev(scico(length(levels(da.negrank.melt$value)), palette='hawaii'))
+names(rank.cols) <- levels(da.negrank.melt$value)
+
+da.negrank.melt$Method <- factor(da.negrank.melt$Method,
+                                 level=c("Milo", "Cydar", "DAseq", "Louvain", "Walktrap"))
 
 ggplot(da.negrank.melt, 
        aes(x=Method, y=variable, fill=value)) +
@@ -478,17 +490,18 @@ ggsave("~/Dropbox/Milo/figures/MethodCompare_PosRank_table.pdf",
        height=3.95, width=6.25, useDingbats=FALSE)
 ```
 
+
+
 ```{r, warning=FALSE, message=FALSE}
 # calculate the rank along each column
 da.posrank.df <- as.data.frame(apply(da.fdr.df[, c("FDR", "FPR", "FNR", "FOR")],
                                      2, FUN=function(X) rank(X)))
 da.posrank.df$Method <- da.fdr.df$Method
 da.posrank.melt <- melt(da.posrank.df, id.vars=c("Method"))
-da.posrank.melt$value <- ordered(da.posrank.melt$value,
-                                 levels=c(1:5))
+da.posrank.melt$value <- ordered(da.posrank.melt$value)
 
-rank.cols <- colorRampPalette(pal_futurama()(3))(5)
-names(rank.cols) <- c(1:5)
+da.posrank.melt$Method <- factor(da.posrank.melt$Method,
+                                 level=c("Milo", "Cydar", "DAseq", "Louvain", "Walktrap"))
 
 ggplot(da.posrank.melt, 
        aes(x=Method, y=variable, fill=value)) +
@@ -506,16 +519,24 @@ ggsave("~/Dropbox/Milo/figures/MethodCompare_NegRank_table.pdf",
        height=3.95, width=6.25, useDingbats=FALSE)
 ```
 
+
 ```{r, warning=FALSE, message=FALSE}
 # calculate the rank along each column
 allrank.melt <- do.call(rbind.data.frame, list("post"=da.posrank.melt, "neg"=da.negrank.melt))
 
-rank.cols <- colorRampPalette(pal_futurama()(3))(5)
-names(rank.cols) <- c(1:5)
+allrank.melt$Method <- factor(allrank.melt$Method,
+                              level=c("Milo", "Cydar", "DAseq", "Louvain", "Walktrap"))
+
+allmeasure.melt <- melt(da.fdr.df, id.vars=c("Method"))
+allmeasure.melt$Method <- factor(allmeasure.melt$Method,
+                                 level=c("Milo", "Cydar", "DAseq", "Louvain", "Walktrap"))
+
 
 ggplot(allrank.melt, 
-       aes(x=Method, y=variable, fill=value)) +
-    geom_tile() +
+       aes(x=Method, y=variable)) +
+    geom_tile(aes(fill=value)) +
+    geom_text(data=allmeasure.melt[!allmeasure.melt$variable %in% c("MCC"), ], 
+              aes(label=round(value, 2)), colour='white', size=5) +
     theme_cowplot() +
     scale_fill_manual(values=rank.cols) +
     labs(x="Method", y="Measure") +
@@ -528,5 +549,348 @@ ggplot(allrank.melt,
 ggsave("~/Dropbox/Milo/figures/MethodCompare_AllRank_table.pdf",
        height=4.15, width=6.95, useDingbats=FALSE)
 ```
+
+These comparisons can also be extended to multiple runs. How consistently does `Milo` perform compared to these other methods?
+
+```{r, warning=FALSE, message=FALSE}
+multi.compare <- readRDS("~/Dropbox/Milo/Methods_comparison_MethodCompare.RDS")
+confuse.df <- multi.compare$confuse.df
+
+confuse.df$PPV[is.na(confuse.df$PPV)] <- 0
+confuse.df$NPV[is.na(confuse.df$NPV)] <- 1
+confuse.df$FDR[is.na(confuse.df$FDR)] <- 1
+confuse.df$FPR[is.na(confuse.df$FPR)] <- 1
+confuse.df$FNR[is.na(confuse.df$FNR)] <- 1
+confuse.df$FOR[is.na(confuse.df$FOR)] <- 1
+confuse.df$TPR[is.na(confuse.df$TPR)] <- 0
+confuse.df$TNR[is.na(confuse.df$TNR)] <- 0
+confuse.df$F1[is.na(confuse.df$F1)] <- 0
+confuse.df$MCC[is.na(confuse.df$MCC)] <- 0
+confuse.df$Power[is.na(confuse.df$Power)] <- 0
+```
+
+I'll compute the ranks for each of the 100 simulations.
+
+```{r, warning=FALSE, message=FALSE}
+unique.runs <- unique(confuse.df$FileID)
+run.ranks.list <- list()
+
+for(x in seq_along(unique.runs)){
+    x.run <- unique.runs[x]
+    x.df <- confuse.df[confuse.df$FileID %in% x.run, ]
+    x.pos <- apply(x.df[, c("FDR", "FPR", "FNR", "FOR")], 2, FUN=function(X) rank(X))
+    x.neg <- apply(x.df[, c("Power", "F1", "TNR", "TPR", "NPV", "PPV")], 2, FUN=function(X) rank(-X))
+    x.all <- cbind.data.frame(x.pos, x.neg)
+    x.all$Method <- x.df$Method
+    
+    run.ranks.list[[x.run]] <- x.all
+}
+
+ranks.run.df <- do.call(rbind.data.frame, run.ranks.list)
+
+ranks.run.df$Method <- factor(ranks.run.df$Method,
+                              level=c("Milo", "Cydar", "DAseq", "Louvain", "Walktrap"))
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+ggplot(ranks.run.df, aes(x=Method, y=Power)) +
+    geom_boxplot() +
+    theme_cowplot() +
+    NULL
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+ggplot(ranks.run.df, aes(x=Method, y=FDR)) +
+    geom_boxplot() +
+    theme_cowplot() +
+    NULL
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+confuse.df$Method <- factor(confuse.df$Method,
+                            level=c("Milo", "Cydar", "DAseq", "Louvain", "Walktrap"))
+
+ggplot(confuse.df, aes(x=Method, y=MCC)) +
+    geom_boxplot(fill='grey80') +
+    theme_cowplot() +
+    expand_limits(y=c(-1)) +
+    theme(axis.text=element_text(size=20),
+          axis.title=element_text(size=22)) +
+    labs(x="Method", y="MCC") +
+    NULL
+
+ggsave("~/Dropbox/Milo/figures/MethodCompare_100MCC-boxplot.pdf",
+       height=2.95, width=6.95, useDingbats=FALSE)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+confuse.df$Method <- factor(confuse.df$Method,
+                            level=c("Milo", "Cydar", "DAseq", "Louvain", "Walktrap"))
+
+ggplot(confuse.df, aes(x=Method, y=FDR)) +
+    geom_boxplot(fill='grey80') +
+    theme_cowplot() +
+    expand_limits(y=c(0, 1.0)) +
+    theme(axis.text=element_text(size=20),
+          axis.title=element_text(size=22)) +
+    labs(x="Method", y="FDR") +
+    NULL
+
+ggsave("~/Dropbox/Milo/figures/MethodCompare_100FDR-boxplot.pdf",
+       height=2.95, width=6.95, useDingbats=FALSE)
+```
+
+```{r, warning=FALSE, message=FALSE}
+ggplot(confuse.df, aes(x=Method, y=FOR)) +
+    geom_boxplot(fill='grey80') +
+    theme_cowplot() +
+    expand_limits(y=c(0, 1.0)) +
+    theme(axis.text=element_text(size=20),
+          axis.title=element_text(size=22)) +
+    labs(x="Method", y="FOR") +
+    NULL
+
+ggsave("~/Dropbox/Milo/figures/MethodCompare_100FOR-boxplot.pdf",
+       height=2.95, width=6.95, useDingbats=FALSE)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+ggplot(confuse.df, aes(x=Method, y=F1)) +
+    geom_boxplot(fill='grey80') +
+    theme_cowplot() +
+    expand_limits(y=c(0, 1.0)) +
+    theme(axis.text=element_text(size=20),
+          axis.title=element_text(size=22)) +
+    labs(x="Method", y="F1") +
+    NULL
+
+ggsave("~/Dropbox/Milo/figures/MethodCompare_100F1-boxplot.pdf",
+       height=2.95, width=6.95, useDingbats=FALSE)
+```
+
+```{r, warning=FALSE, message=FALSE}
+ggplot(confuse.df, aes(x=Method, y=FPR)) +
+    geom_boxplot(fill='grey80') +
+    theme_cowplot() +
+    expand_limits(y=c(0, 1.0)) +
+    theme(axis.text=element_text(size=20),
+          axis.title=element_text(size=22)) +
+    labs(x="Method", y="FPR") +
+    NULL
+
+ggsave("~/Dropbox/Milo/figures/MethodCompare_100FPR-boxplot.pdf",
+       height=2.95, width=6.95, useDingbats=FALSE)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+ggplot(confuse.df, aes(x=Method, y=TPR)) +
+    geom_boxplot(fill='grey80') +
+    theme_cowplot() +
+    expand_limits(y=c(0, 1.0)) +
+    theme(axis.text=element_text(size=20),
+          axis.title=element_text(size=22)) +
+    labs(x="Method", y="TPR") +
+    NULL
+
+ggsave("~/Dropbox/Milo/figures/MethodCompare_100TPR-boxplot.pdf",
+       height=2.95, width=6.95, useDingbats=FALSE)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+ggplot(confuse.df, aes(x=Method, y=PPV)) +
+    geom_boxplot(fill='grey80') +
+    theme_cowplot() +
+    expand_limits(y=c(0, 1.0)) +
+    theme(axis.text=element_text(size=20),
+          axis.title=element_text(size=22)) +
+    labs(x="Method", y="PPV") +
+    NULL
+
+ggsave("~/Dropbox/Milo/figures/MethodCompare_100PPV-boxplot.pdf",
+       height=2.95, width=6.95, useDingbats=FALSE)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+confuse.df$Method <- factor(confuse.df$Method,
+                            level=c("Milo", "Cydar", "DAseq", "Louvain", "Walktrap"))
+
+ggplot(confuse.df, aes(x=Method, y=Power)) +
+    geom_boxplot(fill='grey80') +
+    theme_cowplot() +
+    expand_limits(y=c(0, 1.0)) +
+    theme(axis.text=element_text(size=20),
+          axis.title=element_text(size=22)) +
+    labs(x="Method", y="Power") +
+    NULL
+
+ggsave("~/Dropbox/Milo/figures/MethodCompare_100Power-boxplot.pdf",
+       height=2.95, width=6.95, useDingbats=FALSE)
+```
+
+```{r, warning=FALSE, message=FALSE}
+confuse.df$Method <- factor(confuse.df$Method,
+                            level=c("Milo", "Cydar", "DAseq", "Louvain", "Walktrap"))
+
+ggplot(confuse.df, aes(x=Method, y=NPV)) +
+    geom_boxplot(fill='grey80') +
+    theme_cowplot() +
+    expand_limits(y=c(0, 1.0)) +
+    theme(axis.text=element_text(size=20),
+          axis.title=element_text(size=22)) +
+    labs(x="Method", y="NPV") +
+    NULL
+
+ggsave("~/Dropbox/Milo/figures/MethodCompare_100NPV-boxplot.pdf",
+       height=2.95, width=6.95, useDingbats=FALSE)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+confuse.df$Method <- factor(confuse.df$Method,
+                            level=c("Milo", "Cydar", "DAseq", "Louvain", "Walktrap"))
+
+ggplot(confuse.df, aes(x=Method, y=TNR)) +
+    geom_boxplot(fill='grey80') +
+    theme_cowplot() +
+    expand_limits(y=c(0, 1.0)) +
+    theme(axis.text=element_text(size=20),
+          axis.title=element_text(size=22)) +
+    labs(x="Method", y="TNR") +
+    NULL
+
+ggsave("~/Dropbox/Milo/figures/MethodCompare_100TNR-boxplot.pdf",
+       height=2.95, width=6.95, useDingbats=FALSE)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+confuse.df$Method <- factor(confuse.df$Method,
+                            level=c("Milo", "Cydar", "DAseq", "Louvain", "Walktrap"))
+
+ggplot(confuse.df, aes(x=Method, y=FNR)) +
+    geom_boxplot(fill='grey80') +
+    theme_cowplot() +
+    expand_limits(y=c(0, 1.0)) +
+    theme(axis.text=element_text(size=20),
+          axis.title=element_text(size=22)) +
+    labs(x="Method", y="FNR") +
+    NULL
+
+ggsave("~/Dropbox/Milo/figures/MethodCompare_100FNR-boxplot.pdf",
+       height=2.95, width=6.95, useDingbats=FALSE)
+```
+
+
+How about the rank of the average values across 100 runs?
+
+```{r, warning=FALSE, message=FALSE}
+confuse.melt <- melt(confuse.df, id.vars=c("Method", "FileID"))
+# calculate the mean value across 100 simulations - use these for ranking the methods.
+methods_grouped <- confuse.melt %>% group_by(Method, variable) %>%
+    summarise(Ave=mean(value, na.action='na.rm')) %>%
+    pivot_wider(values_from=Ave, names_from=variable)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# calculate the rank along each column
+da.negrank.df <- as.data.frame(apply(methods_grouped[, c("Power", "F1", "TNR", "NPV", "PPV")],
+                                     2, FUN=function(X) rank(-X)))
+da.negrank.df$Method <- methods_grouped$Method
+da.negrank.melt <- melt(da.negrank.df, id.vars="Method")
+da.negrank.melt$value <- ordered(da.negrank.melt$value)
+
+da.negrank.melt$Method <- factor(da.negrank.melt$Method,
+                                 level=c("Milo", "Cydar", "DAseq", "Louvain", "Walktrap"))
+
+ggplot(da.negrank.melt, 
+       aes(x=Method, y=variable, fill=value)) +
+    geom_tile() +
+    theme_cowplot() +
+    scale_fill_manual(values=rank.cols) +
+    labs(x="Method", y="Measure") +
+     theme(axis.text=element_text(size=18),
+          axis.title=element_text(size=22),
+          legend.text=element_text(size=18),
+          legend.title=element_text(size=20)) +
+    guides(fill=guide_legend(title="Rank"))
+
+ggsave("~/Dropbox/Milo/figures/MethodCompare_100PosRank_table.pdf",
+       height=3.95, width=6.25, useDingbats=FALSE)
+```
+
+
+
+```{r, warning=FALSE, message=FALSE}
+# calculate the rank along each column
+da.posrank.df <- as.data.frame(apply(methods_grouped[, c("FDR", "FPR", "FNR", "FOR")],
+                                     2, FUN=function(X) rank(X)))
+da.posrank.df$Method <- methods_grouped$Method
+da.posrank.melt <- melt(da.posrank.df, id.vars=c("Method"))
+da.posrank.melt$value <- ordered(da.posrank.melt$value)
+
+da.posrank.melt$Method <- factor(da.posrank.melt$Method,
+                                 level=c("Milo", "Cydar", "DAseq", "Louvain", "Walktrap"))
+
+ggplot(da.posrank.melt, 
+       aes(x=Method, y=variable, fill=value)) +
+    geom_tile() +
+    theme_cowplot() +
+    scale_fill_manual(values=rank.cols) +
+    labs(x="Method", y="Measure") +
+    theme(axis.text=element_text(size=18),
+          axis.title=element_text(size=22),
+          legend.text=element_text(size=18),
+          legend.title=element_text(size=20)) +
+    guides(fill=guide_legend(title="Rank"))
+
+ggsave("~/Dropbox/Milo/figures/MethodCompare_100NegRank_table.pdf",
+       height=3.95, width=6.25, useDingbats=FALSE)
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+# calculate the rank along each column
+allrank.melt <- do.call(rbind.data.frame, list("post"=da.posrank.melt, "neg"=da.negrank.melt))
+
+allrank.melt$Method <- factor(allrank.melt$Method,
+                              level=c("Milo", "Cydar", "DAseq", "Louvain", "Walktrap"))
+
+allmeasure.melt <- melt(methods_grouped, id.vars=c("Method"))
+allmeasure.melt$Method <- factor(allmeasure.melt$Method,
+                                 level=c("Milo", "Cydar", "DAseq", "Louvain", "Walktrap"))
+
+
+ggplot(allrank.melt, 
+       aes(x=Method, y=variable)) +
+    geom_tile(aes(fill=value)) +
+    geom_text(data=allmeasure.melt[!allmeasure.melt$variable %in% c("MCC", "TPR"), ], 
+              aes(label=round(value, 2)), colour='black', size=5) +
+    theme_cowplot() +
+    scale_fill_manual(values=rank.cols) +
+    labs(x="Method", y="Measure") +
+     theme(axis.text=element_text(size=18),
+          axis.title=element_text(size=22),
+          legend.text=element_text(size=18),
+          legend.title=element_text(size=20)) +
+    guides(fill=guide_legend(title="Rank"))
+
+ggsave("~/Dropbox/Milo/figures/MethodCompare_100AllRank_table.pdf",
+       height=4.15, width=6.95, useDingbats=FALSE)
+```
+
+
+
+
+
+
 
 

@@ -117,6 +117,7 @@ testing.meta$AgeInt <- as.numeric(as.character(gsub(testing.meta$Condition, patt
 ```{r, warning=FALSE, message=FALSE}
 thymus.mylo <- buildGraph(thymus.mylo, k=30, d=30, seed=42)
 thymus.mylo <- makeNhoods(thymus.mylo, prop=0.25, k=30, d=15, refined=TRUE, reduced_dims="PCA")
+thymus.mylo <- calcNhoodDistance(thymus.mylo, d=15)
 thymus.mylo <- countCells(thymus.mylo, meta.data=thymus.meta, samples="ExpSamp")
 ```
 
