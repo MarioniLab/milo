@@ -43,6 +43,7 @@ add_synthetic_labels_pop <- function(sce, # SingleCellExperiment obj
                                      n_conditions=2, # number of conditions to simulate
                                      n_replicates=3, # number of replicates per condition
                                      n_batches = 2, # number of technical batches per condition (at least 2 replicates per batch)
+                                     condition_balance = 1, # the distribution of cells across conditions (1 = equal)
                                      m=2, # Fuzziness parameter (higher m, more fuzziness)
                                      seed=42){
   
@@ -81,7 +82,9 @@ add_synthetic_labels_pop <- function(sce, # SingleCellExperiment obj
     enr_scores[pop] <- pop_enr
   }
   
-  enr_prob <- sapply(1:ncol(w), function(i) .scale_to_range(w[,i], min=0.5, max=enr_scores[i]))
+  # altering the baseline probability can induce a skew towards a condition across _all_ cells
+  enr_prob <- sapply(1:ncol(w), function(i) .scale_to_range(w[,i], min=0.5*condition_balance,
+                                                            max=enr_scores[i]))
   colnames(enr_prob) <- colnames(centroid_emb)
   
   # need to integrate over these to get the condition probabilities
@@ -101,8 +104,10 @@ add_synthetic_labels_pop <- function(sce, # SingleCellExperiment obj
   
   # Generate labels for condition and replicates
   synth_labels <- sapply(1:nrow(cond_probability),  function(i) sample(colnames(cond_probability), size = 1, prob = cond_probability[i,]))
+  
   replicates <- paste0("R", 1:n_replicates)
   batches <- sample(paste0("B", rep(1:n_batches, each=n_replicates)))
+  
   synth_samples <- paste0(synth_labels, "_", replicates)
   if(n_batches > 1){
    names(batches) <- sort(unique(synth_samples))
