@@ -11,7 +11,7 @@ library(cydar)
 library(pdist)
   })
 
-## Set-up reticulate 4 MELD
+# ## Set-up reticulate 4 MELD
 reticulate::use_condaenv("emma_env", required=TRUE)
 library(reticulate) ## development version of reticulate, or numba use breaks C stack
 
@@ -45,6 +45,7 @@ add_synthetic_labels_pop <- function(sce, # SingleCellExperiment obj
                                      n_conditions=2, # number of conditions to simulate
                                      n_replicates=3, # number of replicates per condition
                                      n_batches = 2, # number of technical batches per condition (at least 2 replicates per batch)
+                                     condition_balance = 1, # the distribution of cells across conditions (1 = equal)
                                      m=2, # Fuzziness parameter (higher m, more fuzziness)
                                      seed=42){
   
@@ -58,7 +59,7 @@ add_synthetic_labels_pop <- function(sce, # SingleCellExperiment obj
   ## Find cluster center
   cluster_membership = sce[[pop_column]]
   centroid_emb <- .find_centroid(X_emb, cluster_membership)
-  
+
   ## Assign weight to each cell for each cluster center
   centroid_dist <- pdist(X_emb, t(centroid_emb))
   centroid_dist <- as.matrix(centroid_dist)
@@ -71,23 +72,51 @@ add_synthetic_labels_pop <- function(sce, # SingleCellExperiment obj
   colnames(w) <- colnames(centroid_emb)
   rownames(w) <- rownames(X_emb)
   w <- apply(scale(w), 2, .logit, a=1)
-  
   ## Normalize weights from enr_score to 0.5
-  enr_scores <- runif(ncol(w)) ## Generate enrichment prob for each cluster
+  enr_scores <- rep(0.5, ncol(w)) ## Generate enrichment prob for each cluster
+  # enr_scores <- runif(ncol(w)) ## Generate enrichment prob for each cluster
   names(enr_scores) <- colnames(w)
-  enr_scores[pop] <- pop_enr
-  enr_prob <- sapply(1:ncol(w), function(i) .scale_to_range(w[,i], min=0.5, max=enr_scores[i]))
+  if(length(pop_enr) == length(pop)){
+    enr_scores[pop] <- pop_enr
+  } else{
+    # assume all pops have the same enrichment
+    pop_enr <- rep(pop_enr, length(pop))
+    enr_scores[pop] <- pop_enr
+  }
+  
+  # altering the baseline probability can induce a skew towards a condition across _all_ cells
+  enr_prob <- sapply(1:ncol(w), function(i) .scale_to_range(w[,i], min=0.5*condition_balance,
+                                                            max=enr_scores[i]))
   colnames(enr_prob) <- colnames(centroid_emb)
-  cond_probability <- enr_prob[,pop]
+  
+  # need to integrate over these to get the condition probabilities
+  # need to set relevant pops only, force the others to ~0.5
+  prob_matrix <- enr_prob[,pop]
+  if(is(prob_matrix, "matrix")){
+    cond_probability <- rowMeans(prob_matrix)
+    for(x in seq_along(pop)){
+      cond_probability[sce[[pop_column]] == pop[x]] <- prob_matrix[sce[[pop_column]] == pop[x], pop[x]]
+    }
+  } else{
+    cond_probability <- prob_matrix
+  }
+  
   cond_probability = cbind(cond_probability, 1 - cond_probability)
   colnames(cond_probability) = conditions
   
   # Generate labels for condition and replicates
   synth_labels <- sapply(1:nrow(cond_probability),  function(i) sample(colnames(cond_probability), size = 1, prob = cond_probability[i,]))
+  
   replicates <- paste0("R", 1:n_replicates)
   batches <- sample(paste0("B", rep(1:n_batches, each=n_replicates)))
+  
   synth_samples <- paste0(synth_labels, "_", replicates)
-  names(batches) <- sort(unique(synth_samples))
+  if(n_batches > 1){
+   names(batches) <- sort(unique(synth_samples))
+  } else{
+    batches <- rep("B1", length(unique(synth_samples)))
+    names(batches) <- unique(synth_samples)
+  }
   synth_batches <- batches[synth_samples]
   
   # Add synthetic labels and probabilities to colData

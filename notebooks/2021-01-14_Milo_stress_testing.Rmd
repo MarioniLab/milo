@@ -1,0 +1,2830 @@
+---
+title: "Milo stress testing: parameter robustness"
+output: html_notebook
+---
+
+There are 3 parameters that can principally affect the performance of Milo for differential abundance testing; FDR is not considered as this 
+is at the discretion of the user and thus is not considered a fundamental parameter, despite it's importance.
+
+This notebook lays out the stress-testing of Milo, by varying these parameters with a set of input data sets with a ground truth for:
+
+* Identity of differentialy abundant neighbourhoods
+* Magnitude of differential abundance, i.e. known log fold changes.
+
+These two factors allow us to explore how altering Milo's parameter values impact on a) DA detection sensitivity, i.e. statistical power in the 
+conventional sense of type II error rate, and b) the break-down point of Milo and the DA testing framework. These are important for 
+being able to benchmark Milo on different data sets, and to properly compare it to alternative differential abundance methods.
+
+```{r, message=FALSE}
+library(SingleCellExperiment)
+library(miloR)
+library(reshape2)
+library(ggplot2)
+library(ggsci)
+library(ggthemes)
+library(dplyr)
+library(viridis)
+library(cowplot)
+library(irlba)
+library(BiocStyle)
+```
+
+This notebook is divided into discrete sections that deal with 1) demonstrating the impact of Milo parameter choices on simulated and 
+real-word data, 2) the impact of such choices in DA sensitivity.
+
+## The impact of vary Milo parameters
+
+The 3 parameters of interest are:
+* k - the number of nearest neighbours considered in graph building
+* d - the number of reduced dimensions to compute the nearest neighbours and distances between single-cells
+* prop - the proportion of the single-cells to sample when constructing neighbourhoods.
+
+A fourth, important, consideration is the input gene-set, and how varying this impacts on Milo's performance. Whilst this is not strictly a 
+parameter of Milo, it defines the higher-dimensional manifold, and thus informs the reduced dimensional representation and graph structure. I 
+will test several scenarios/approaches for highly variable gene selection on real-world data sets:
+
+* `modelGeneVar` implemented in the `r Biocpkg("scran")` package, and represents the canonical approach to selecting HVGs based on modelling the 
+mean-variance dependence. I will select HVGs with 10% FDR. This approach has the benefit of being statistically defensible.
+* Top HVGs. Using `modelGeneVar`, I will rank genes and take the top 500,1000,2000,3000,4000 & 5000 genes as the input gene set
+* Random genes. I will randomly select 500,1000,2000,3000,4000 & 5000 genes as the input gene set.
+
+Finally, the exact data sets for evaluating Milo robustness and sensitivity are:
+
+* Simulated discrete clusters
+* Simulated linear trajectory
+* Simulated branching trajectory
+* Real-world data with synthetic labels (i.e. create a known ground truth _in silico_).
+* Real-world data as-is
+
+We include some simple demo data in the `Milo` package, one of discrete clusters and another of a simple linear trajectory. A more complex 
+branching trajectory will be generated using the `dyngen` package. For the real-world data the `MouseGastrulationData` provides a natural 
+example of a complex data set, and includes 2 perturbations that can be used for both synthetic labelling and testing without a ground truth.
+
+As a consequence of these sensitivity analyses we would also like to come up with one or more diagnostic plots or summary statistcs that can 
+be used to guide parameter values choices. For instance, calculating within-neighbourhood distance variance might indicate whether 
+neighbourhoods are more or less diffuse or contain cells that are very different from the rest of the neighbourhood. Likewise, computing the 
+ratio of within-neighbourhood to between-neighbourhood distances might suggest a homogenisation of distances that can occur with too many 
+input dimensions, i.e. cells & neighbourhoods start to become equidistant. Ideally, any measure or statistic will not require the repeated 
+building of graphs or neighbourhoods to help reduce the computational burden for very large data sets.
+
+I'll define a couple of convenience functions to compute these two values.
+
+```{r, warning=FALSE, message=FALSE}
+computeStats <- function(x, ...){
+  require(Matrix)
+  # compute the mean and variance of distances
+  # input is a distance matrix
+  x.mean <- mean(Matrix::rowMeans(x))
+  x.var <- var(apply(x, 1, var))
+  return(data.frame("mean"=x.mean, "var"=x.var))
+}
+
+nhoodSummary <- function(x, ...){
+  # use a Milo object as input
+  if(!is.null(nhoodDistances(x))){
+    nhood.stats <- do.call(rbind.data.frame, lapply(nhoodDistances(x), FUN=computeStats))
+    return(nhood.stats)
+  } else{
+    stop("Compute nhood distances first")
+  }
+}
+
+nhoodRatio <- function(x, d=50,  reduced.dim="PCA", ...){
+  require(BiocNeighbors)
+  # calcuate the ratio of within-nhood distances (distance from index to kth cell)
+  # to the between nhood-distance (distance to nearest other index cell)
+  if(length(nhoodIndex(x)) > 0){
+    # get the maximum distance in each nhood
+    within.dist <- sapply(unlist(nhoodIndex(x)), FUN=function(X) max(nhoodDistances(x)[[paste0(X)]]))
+    # find the 1NN between nhoodIndex cells
+    between.dist <- findKNN(reducedDim(x[, unlist(nhoodIndex(x))], reduced.dim)[, c(1:d)],
+                            k=1)$distance
+    dist.ratio <- within.dist/between.dist
+    return(dist.ratio)
+  } else{
+    stop("Compute nhoods first")
+  }
+  
+}
+
+
+nhoodOverlap <- function(x, ...){
+  # compute the average overlap between nhoods
+  require(Matrix)
+  if(ncol(nhoodAdjacency(x)) > 1){
+    suppressWarnings(av.overlap <- mean(nhoodAdjacency(x)[lower.tri(nhoodAdjacency(x))]))
+    return(av.overlap)
+  } else{
+    x <- buildNhoodGraph(x)
+    suppressWarnings(av.overlap <- mean(nhoodAdjacency(x)[lower.tri(nhoodAdjacency(x))]))
+    return(av.overlap)
+  }
+}
+```
+
+
+## Simulated discrete clusters
+
+For the discrete and simulated trajectories there are a fixed number of genes, so I won't perform HVG selection on these - I'll leave that 
+for the real-world data with and without synthetic labels.
+
+```{r, warning=FALSE}
+discrete.milo <- Milo(sim_discrete$SCE)
+discrete.meta <- sim_discrete$meta
+
+colData(discrete.milo)$Condition <- discrete.meta$Condition
+colData(discrete.milo)$Block <- discrete.meta$Block
+colData(discrete.milo)$Sample <- discrete.meta$Sample
+colData(discrete.milo)$Replicate <- discrete.meta$Replicate
+```
+
+For these data we know the ground truth, i.e. which clusters are DA, and we know the magnitude of this difference.
+
+```{r}
+table(discrete.milo$Sample, discrete.milo$Block)
+```
+
+The cells are split into 4 blocks (discrete clusters), which are DA between conditions ('A' & 'B').
+
+### The impact of varying `k`
+
+We want to test how robust the Milo DA analysis is to detecting the a) the DA clusters and b) accurately estimating the fold-change when we 
+have differently structured graph based on computing the distances. I will fix `d=20` and `props=0.2`.
+
+```{r, message=FALSE, warning=FALSE}
+k.vec <- c(5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100)
+tp.cells <- unique(c(colnames(discrete.milo[,discrete.milo$Block %in% c("B4")]), colnames(discrete.milo[,discrete.milo$Block %in% c("B1")])))
+tn.cells <- unique(c(colnames(discrete.milo[,discrete.milo$Block %in% c("B2")]), colnames(discrete.milo[,discrete.milo$Block %in% c("B3")])))
+
+d <- 20
+props <- 0.2
+
+discrete.test.meta <- data.frame("Sample"=unique(discrete.milo$Sample))
+discrete.test.meta$Condition <- gsub(discrete.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\1")
+discrete.test.meta$Replicate <- gsub(discrete.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\2")
+rownames(discrete.test.meta) <- discrete.test.meta$Sample
+
+k.res.list <- list()
+k.confuse.list <- list()
+k.stat.list <- list()
+k.ratio.list <- list()
+k.overlap.list <- list()
+for(i in seq_along(k.vec)){
+  k <- k.vec[i]
+  i.milo <- buildGraph(discrete.milo, k=k, d=d, reduced.dim="PCA")
+  i.milo <- makeNhoods(i.milo, k=k, d=d, prop=props, refined=TRUE)
+  i.milo <- countCells(i.milo, samples="Sample", meta.data=as.data.frame(colData(i.milo)))
+  i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+  k.stat <- nhoodSummary(i.milo)
+  k.stat$k <- k
+  k.stat.list[[paste0(k)]] <- k.stat
+  k.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+  k.ratio$k <- k
+  colnames(k.ratio) <- c("DistRatio", "k")
+  k.ratio.list[[paste0(k)]] <- k.ratio
+  
+  k.overlap <- data.frame("MeanOverlap"=nhoodOverlap(i.milo))
+  k.overlap$k <- k
+  k.overlap.list[[paste0(k)]] <- k.overlap
+  
+  i.res <- testNhoods(i.milo, design.df=discrete.test.meta, design=~Condition, fdr.weighting="k-distance")
+  i.res <- annotateNhoods(i.milo, coldata_col="Block", da.res=i.res)
+  
+  i.res$k <- k
+  k.res.list[[paste0(k)]] <- i.res
+  
+  i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1]], 1, FUN=function(X) any(X> 0))])
+  
+  k.tp <- length(intersect(tp.cells, i.da))
+  k.fp <- length(intersect(tn.cells, i.da))
+  k.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+  k.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+  
+  k.confuse.list[[paste0(k)]] <- data.frame("TP"=k.tp, "FP"=k.fp, "TN"=k.tn, "FN"=k.fn, "k"=k)
+}
+
+k.res.df <- do.call(rbind.data.frame, k.res.list)
+k.res.df$Sig <- k.res.df$SpatialFDR < 0.1
+
+k.stat.df <- do.call(rbind.data.frame, k.stat.list)
+k.ratio.df <- do.call(rbind.data.frame, k.ratio.list)
+
+k.overlap.df <- do.call(rbind.data.frame, k.overlap.list)
+
+k.confuse.df <- do.call(rbind.data.frame, k.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of k
+k.confuse.df$TPR <- k.confuse.df$TP/(k.confuse.df$TP + k.confuse.df$FN)
+k.confuse.df$FPR <- k.confuse.df$FP/(k.confuse.df$FP + k.confuse.df$TN)
+k.confuse.df$TNR <- k.confuse.df$TN/(k.confuse.df$FP + k.confuse.df$TN)
+k.confuse.df$FNR <- k.confuse.df$FN/(k.confuse.df$TP + k.confuse.df$FN)
+k.confuse.df$FDR <- k.confuse.df$FP/(k.confuse.df$TP + k.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+k.mean.df <- k.res.df[k.res.df$Sig, ] %>% group_by(Block, k) %>%
+  summarise(mean(logFC))
+
+k.var.df <- k.res.df[k.res.df$Sig, ] %>% group_by(Block, k) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying k using some of the measures defined by a confusion matrix, i.e. TPR, FPR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=8.95}
+k.confuse.melt <- melt(k.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'k'))
+colnames(k.confuse.melt) <- c("TP", "FP", "TN", "FN", "Kval", "Measure", "Value")
+k.confuse.melt$Kval <- ordered(k.confuse.melt$Kval,
+                               levels=k.vec)
+
+ggplot(k.confuse.melt, 
+       aes(x=Kval, y=Value, fill=Measure)) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_cowplot() + 
+  scale_fill_aaas() +
+  facet_wrap(~Measure, scales="free")  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="k", y="Measure") +
+  NULL
+```
+
+For the discrete example with a fixed `d=20` and `prop=0.2`, there is a trade-off for `k`, such that $k\get30$ there is no impact on the 
+performance of Milo. My suspicion is because this is a trivially discrete simulation, that the neighbourhoods begin to overlap the clusters, 
+thus masking the smaller DA region ("Block4").
+
+How do the neighbourhood distances vary across different k values?
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+k.stat.df$k <- ordered(k.stat.df$k, levels=k.vec)
+
+ggplot(k.stat.df,
+       aes(x=k, y=mean)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="K", y="Mean nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+Given the fixed `d`, the mean nhood distance increases with higher `k`. That makes sense that the neighbourhood become more and more diffuse.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+ggplot(k.stat.df,
+       aes(x=k, y=var)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="K", y="Variance nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+This shows that the distance variance decreases as a function of `k`. This might be what is expected if increasing `k` also leads to a 
+homogenisation of nhood distances. What about the distance ratio?
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+k.ratio.df$k <- ordered(k.ratio.df$k, levels=k.vec)
+
+ggplot(k.ratio.df,
+       aes(x=k, y=DistRatio)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="K", y="Nhood distance ratio") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+This ratio appears to increase slightly, but then stabilise past $k=20$. What does this say? At any given value of `k`, there is a distribution 
+of within- to between-nhood distance ratios. Moreover, as `k` increases, the median increases slightly, but the tail of the distribution gets 
+asymetrically longer.
+
+
+```{r}
+k.merge.df <- merge(k.ratio.df, k.confuse.df, by='k')
+k.merge.df$FDR <- ordered(k.merge.df$FDR)
+
+ggplot(k.merge.df, aes(x=FDR, y=DistRatio)) +
+  geom_boxplot() +
+  #facet_wrap(~k) +
+  coord_flip() +
+  theme_cowplot()
+  
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+ggplot(k.overlap.df, aes(x=k, y=MeanOverlap)) +
+  geom_point() +
+  theme_cowplot() +
+  NULL
+
+
+
+```
+
+
+
+
+### The impact of varying `d`
+
+Now we have seen the impact of varying `k`, I will vary `d` from 2 to 50 and fix `k=10`.
+
+```{r, message=FALSE}
+d.vec <- c(2, 3, 4, 5, 6, 7, 10, 12, 15, 18, 20, 25, 30, 35, 40, 45, 50)
+tp.cells <- unique(c(colnames(discrete.milo[,discrete.milo$Block %in% c("B4")]), colnames(discrete.milo[,discrete.milo$Block %in% c("B1")])))
+tn.cells <- unique(c(colnames(discrete.milo[,discrete.milo$Block %in% c("B2")]), colnames(discrete.milo[,discrete.milo$Block %in% c("B3")])))
+
+k <- 10
+props <- 0.2
+
+discrete.test.meta <- data.frame("Sample"=unique(discrete.milo$Sample))
+discrete.test.meta$Condition <- gsub(discrete.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\1")
+discrete.test.meta$Replicate <- gsub(discrete.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\2")
+rownames(discrete.test.meta) <- discrete.test.meta$Sample
+
+d.res.list <- list()
+d.confuse.list <- list()
+d.stat.list <- list()
+d.ratio.list <- list()
+for(i in seq_along(d.vec)){
+  d <- d.vec[i]
+  i.milo <- buildGraph(discrete.milo, k=k, d=d, reduced.dim="PCA")
+  i.milo <- makeNhoods(i.milo, k=k, d=d, prop=props, refined=TRUE)
+  i.milo <- countCells(i.milo, samples="Sample", meta.data=as.data.frame(colData(i.milo)))
+  i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+  d.stat <- nhoodSummary(i.milo)
+  d.stat$d <- d
+  d.stat.list[[paste0(d)]] <- d.stat
+  d.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+  d.ratio$d <- d
+  colnames(d.ratio) <- c("DistRatio", "d")
+  d.ratio.list[[paste0(d)]] <- d.ratio
+  
+  i.res <- testNhoods(i.milo, design.df=discrete.test.meta, design=~Condition, fdr.weighting="k-distance")
+  i.res <- annotateNhoods(i.milo, coldata_col="Block", da.res=i.res)
+  
+  i.res$d <- d
+  d.res.list[[paste0(d)]] <- i.res
+  
+  i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1]], 1, FUN=function(X) any(X> 0))])
+  
+  d.tp <- length(intersect(tp.cells, i.da))
+  d.fp <- length(intersect(tn.cells, i.da))
+  d.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+  d.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+  
+  d.confuse.list[[paste0(d)]] <- data.frame("TP"=d.tp, "FP"=d.fp, "TN"=d.tn, "FN"=d.fn, "d"=d)
+}
+
+d.res.df <- do.call(rbind.data.frame, d.res.list)
+d.res.df$Sig <- d.res.df$SpatialFDR < 0.1
+
+d.stat.df <- do.call(rbind.data.frame, d.stat.list)
+d.ratio.df <- do.call(rbind.data.frame, d.ratio.list)
+
+d.confuse.df <- do.call(rbind.data.frame, d.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of d
+d.confuse.df$TPR <- d.confuse.df$TP/(d.confuse.df$TP + d.confuse.df$FN)
+d.confuse.df$TNR <- d.confuse.df$TN/(d.confuse.df$FP + d.confuse.df$TN)
+d.confuse.df$FNR <- d.confuse.df$FN/(d.confuse.df$TP + d.confuse.df$FN)
+d.confuse.df$FDR <- d.confuse.df$FP/(d.confuse.df$TP + d.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+d.mean.df <- d.res.df[d.res.df$Sig, ] %>% group_by(Block, d) %>%
+  summarise(mean(logFC))
+
+d.var.df <- d.res.df[d.res.df$Sig, ] %>% group_by(Block, d) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying d using some of the measures defined by a confusion matrix, i.e. TPR, FPR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=8.95}
+d.confuse.melt <- melt(d.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'd'))
+colnames(d.confuse.melt) <- c("TP", "FP", "TN", "FN", "Dval", "Measure", "Value")
+d.confuse.melt$Dval <- ordered(d.confuse.melt$Dval,
+                               levels=d.vec)
+
+ggplot(d.confuse.melt, 
+       aes(x=Dval, y=Value, fill=Measure)) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_cowplot() + 
+  scale_fill_aaas() +
+  facet_wrap(~Measure, scales="free")  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="Measure") +
+  NULL
+```
+
+The impact of varying d has less of a linear effect, demonstrating that each dimension captures different axes of variation in the higher 
+dimensional space. 
+
+How do the neighbourhood distances vary across different d values?
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+d.stat.df$d <- ordered(d.stat.df$d, levels=d.vec)
+
+ggplot(d.stat.df,
+       aes(x=d, y=mean)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="#Dimensions", y="Mean nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+Given the fixed `k`, the mean nhood distance increases with higher `d`. That makes sense as the distance will linearly increase with a 
+linear increase in the number of dimensions.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+ggplot(d.stat.df,
+       aes(x=d, y=var)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="#Dimensions", y="Variance nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+This shows that the distance variance also increases as a function of `d`, but not linearly. We can also see that more nhood are more variable 
+with a high `d`.
+
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+d.ratio.df$d <- ordered(d.ratio.df$d, levels=d.vec)
+
+ggplot(d.ratio.df,
+       aes(x=d, y=DistRatio)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="#Dimensions", y="Nhood distance ratio") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+Now that's a bit more interesting. The distance ratio decreases and become less variable down to ~12-15 dimensions, but then starts to increase 
+again.
+
+The next logical step is to see how `k` and `d` co-vary.
+
+### The impact of co-varying `d` and `k`
+
+Now we have seen the impact of varying `k` and `d` separately I will vary `d` from 2 to 50 and vary `k` from 5 to 100.
+
+```{r, message=FALSE, warning=FALSE}
+d.vec <- c(2, 3, 4, 5, 6, 7, 10, 12, 15, 18, 20, 25, 30, 35, 40, 45, 50)
+tp.cells <- unique(c(colnames(discrete.milo[,discrete.milo$Block %in% c("B4")]), colnames(discrete.milo[,discrete.milo$Block %in% c("B1")])))
+tn.cells <- unique(c(colnames(discrete.milo[,discrete.milo$Block %in% c("B2")]), colnames(discrete.milo[,discrete.milo$Block %in% c("B3")])))
+
+props <- 0.2
+
+discrete.test.meta <- data.frame("Sample"=unique(discrete.milo$Sample))
+discrete.test.meta$Condition <- gsub(discrete.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\1")
+discrete.test.meta$Replicate <- gsub(discrete.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\2")
+rownames(discrete.test.meta) <- discrete.test.meta$Sample
+
+kd.res.list <- list()
+kd.confuse.list <- list()
+kd.stat.list <- list()
+kd.ratio.list <- list()
+for(i in seq_along(d.vec)){
+  d <- d.vec[i]
+  for(j in seq_along(k.vec)){
+    k <- k.vec[j]
+    i.milo <- buildGraph(discrete.milo, k=k, d=d, reduced.dim="PCA")
+    i.milo <- makeNhoods(i.milo, k=k, d=d, prop=props, refined=TRUE)
+    i.milo <- countCells(i.milo, samples="Sample", meta.data=as.data.frame(colData(i.milo)))
+    i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+    kd.stat <- nhoodSummary(i.milo)
+    kd.stat$d <- d
+    kd.stat$k <- k
+    kd.stat.list[[paste0(k,d)]] <- kd.stat
+    kd.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+    kd.ratio$d <- d
+    kd.ratio$k <- k
+    colnames(kd.ratio) <- c("DistRatio", "d", "k")
+    kd.ratio.list[[paste0(k,d)]] <- kd.ratio
+    
+    i.res <- testNhoods(i.milo, design.df=discrete.test.meta, design=~Condition, fdr.weighting="k-distance")
+    i.res <- annotateNhoods(i.milo, coldata_col="Block", da.res=i.res)
+    
+    i.res$d <- d
+    i.res$k <- k
+    kd.res.list[[paste0(k,d)]] <- i.res
+    
+    i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1]], 1, FUN=function(X) any(X> 0))])
+    
+    d.tp <- length(intersect(tp.cells, i.da))
+    d.fp <- length(intersect(tn.cells, i.da))
+    d.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+    d.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+    
+    kd.confuse.list[[paste0(k,d)]] <- data.frame("TP"=d.tp, "FP"=d.fp, "TN"=d.tn, "FN"=d.fn, "d"=d, "k"=k)
+  }
+}
+
+kd.res.df <- do.call(rbind.data.frame, kd.res.list)
+kd.res.df$Sig <- kd.res.df$SpatialFDR < 0.1
+
+kd.stat.df <- do.call(rbind.data.frame, kd.stat.list)
+kd.ratio.df <- do.call(rbind.data.frame, kd.ratio.list)
+
+kd.confuse.df <- do.call(rbind.data.frame, kd.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of d
+kd.confuse.df$TPR <- kd.confuse.df$TP/(kd.confuse.df$TP + kd.confuse.df$FN)
+kd.confuse.df$FPR <- kd.confuse.df$FP/(kd.confuse.df$FP + kd.confuse.df$TN)
+kd.confuse.df$TNR <- kd.confuse.df$TN/(kd.confuse.df$FP + kd.confuse.df$TN)
+kd.confuse.df$FNR <- kd.confuse.df$FN/(kd.confuse.df$TP + kd.confuse.df$FN)
+kd.confuse.df$FDR <- kd.confuse.df$FP/(kd.confuse.df$TP + kd.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+kd.mean.df <- kd.res.df[kd.res.df$Sig, ] %>% group_by(Block, d, k) %>%
+  summarise(mean(logFC))
+
+kd.var.df <- kd.res.df[kd.res.df$Sig, ] %>% group_by(Block, d, k) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying d using some of the measures defined by a confusion matrix, i.e. TPR, FPR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+kd.confuse.melt <- melt(kd.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'd', 'k'))
+colnames(kd.confuse.melt) <- c("TP", "FP", "TN", "FN", "Dval", "Kval", "Measure", "Value")
+kd.confuse.melt$Dval <- ordered(kd.confuse.melt$Dval,
+                                levels=d.vec)
+kd.confuse.melt$Kval <- ordered(kd.confuse.melt$Kval,
+                                levels=k.vec)
+
+
+ggplot(kd.confuse.melt[kd.confuse.melt$Measure %in% c("TPR"), ], 
+       aes(x=Dval, y=Kval, fill=Value)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis() +
+  facet_wrap(~Measure)  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+This grid shows the TPR as a function of the number input dimensions and `k`.
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.confuse.melt[kd.confuse.melt$Measure %in% c("FDR"), ], 
+       aes(x=Dval, y=Kval, fill=Value)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=-1) +
+  facet_wrap(~Measure)  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+This shows the FDR as a function of the number of PCs and `k`. For these discrete simulations, $k\leq10$ seems to perform best with a small 
+number of input dimensions. This is the cell-wise FDR, such that some cells will fall into DA neighbourhoods, despite not belonging to a truly 
+DA cluster. Therefore, the FDR may appear inflated. The lowest FDR is actually with 12 dimensions and $k=5$, indicating that the optimal 
+parameter values are likely to be a function of the input data set.x
+
+```{r, warning=FALSE, message=FALSE}
+dis.pca <- prcomp_irlba(t(logcounts(discrete.milo)), n=50)
+plot(dis.pca$sdev)
+```
+
+One thing to consider might be the number of leading eigenvalues, this would guide `d` at least. In this case there is only 1 very large PC, 
+but we must have $\geq2$ dimensions, so I'll use 3.
+
+How do the distance measures co-vary with `d` and `k`? I'll average over each pair of k and d values.
+
+```{r, warning=FALSE, message=FALSE}
+# calculate the mean and variance distances and ratios
+kd.stat.mean.df <- kd.stat.df %>% group_by(d, k) %>%
+  summarise(mean(mean))
+colnames(kd.stat.mean.df) <- c("d", "k", "Mean")
+kd.stat.mean.df$d <- ordered(kd.stat.mean.df$d, levels=d.vec)
+kd.stat.mean.df$k <- ordered(kd.stat.mean.df$k, levels=k.vec)
+
+kd.stat.var.df <- kd.stat.df %>% group_by(d, k) %>%
+  summarise(mean(var))
+colnames(kd.stat.var.df) <- c("d", "k", "Var")
+kd.stat.var.df$d <- ordered(kd.stat.var.df$d, levels=d.vec)
+kd.stat.var.df$k <- ordered(kd.stat.var.df$k, levels=k.vec)
+
+kd.ratio.mean.df <- kd.ratio.df %>% group_by(d, k) %>%
+  summarise(mean(DistRatio))
+colnames(kd.ratio.mean.df) <- c("d", "k", "DistRatio")
+kd.ratio.mean.df$d <- ordered(kd.ratio.mean.df$d, levels=d.vec)
+kd.ratio.mean.df$k <- ordered(kd.ratio.mean.df$k, levels=k.vec)
+```
+
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.stat.mean.df, 
+       aes(x=d, y=k, fill=Mean)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=1) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+This is the average of the mean nhood distances. Not an especially interesting relationship between `k` and `d` in this respect. It makes sense 
+that the average distance increases with both `k` and `d`. The effect of `d` is bigger than `k`, as this increases the dimensionality. I would 
+expect `k` to have more of an impact on the distance variance than the mean.
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.stat.var.df, 
+       aes(x=d, y=k, fill=Var)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=1) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+The average distance variance is generally pretty low. It's only for extreme value of `k` and `d` where it is dramatically different.
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.ratio.mean.df, 
+       aes(x=d, y=k, fill=DistRatio)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=1) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+For the distance ratio, there is an extreme impact of `k` with a small number of dimensions. However, this effect seems to be off-set by 
+increasing `d`. Is this useful? Possibly.
+
+
+### The impact of varying `prop`
+
+Finally, what effect does varying the initial sampling proportion have? I will fix k=10 and d=10 for this.
+
+```{r, message=FALSE, warning=FALSE}
+prop.vec <- c(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+tp.cells <- unique(c(colnames(discrete.milo[,discrete.milo$Block %in% c("B4")]), colnames(discrete.milo[,discrete.milo$Block %in% c("B1")])))
+tn.cells <- unique(c(colnames(discrete.milo[,discrete.milo$Block %in% c("B2")]), colnames(discrete.milo[,discrete.milo$Block %in% c("B3")])))
+
+d <- 3
+k <- 10
+
+discrete.test.meta <- data.frame("Sample"=unique(discrete.milo$Sample))
+discrete.test.meta$Condition <- gsub(discrete.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\1")
+discrete.test.meta$Replicate <- gsub(discrete.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\2")
+rownames(discrete.test.meta) <- discrete.test.meta$Sample
+
+prop.res.list <- list()
+prop.confuse.list <- list()
+prop.ratio.list <- list()
+prop.stat.list <- list()
+for(i in seq_along(prop.vec)){
+  prop <- prop.vec[i]
+  i.milo <- buildGraph(discrete.milo, k=k, d=d, reduced.dim="PCA")
+  i.milo <- makeNhoods(i.milo, k=k, d=d, prop=prop, refined=TRUE)
+  i.milo <- countCells(i.milo, samples="Sample", meta.data=as.data.frame(colData(i.milo)))
+  i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+  prop.stat <- nhoodSummary(i.milo)
+  prop.stat$prop <- prop
+  prop.stat.list[[paste0(prop)]] <- prop.stat
+  prop.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+  prop.ratio$prop <- prop
+  colnames(prop.ratio) <- c("DistRatio", "prop")
+  prop.ratio.list[[paste0(prop)]] <- prop.ratio
+  
+  i.res <- testNhoods(i.milo, design.df=discrete.test.meta, design=~Condition, fdr.weighting="k-distance")
+  i.res <- annotateNhoods(i.milo, coldata_col="Block", da.res=i.res)
+  
+  i.res$prop <- prop
+  prop.res.list[[paste0(prop)]] <- i.res
+  
+  i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1]], 1, FUN=function(X) any(X> 0))])
+  
+  prop.tp <- length(intersect(tp.cells, i.da))
+  prop.fp <- length(intersect(tn.cells, i.da))
+  prop.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+  prop.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+  
+  prop.confuse.list[[paste0(prop)]] <- data.frame("TP"=prop.tp, "FP"=prop.fp, "TN"=prop.tn, "FN"=prop.fn, "Prop"=prop)
+}
+
+prop.res.df <- do.call(rbind.data.frame, prop.res.list)
+prop.res.df$Sig <- prop.res.df$SpatialFDR < 0.1
+
+prop.stat.df <- do.call(rbind.data.frame, prop.stat.list)
+prop.ratio.df <- do.call(rbind.data.frame, prop.ratio.list)
+
+prop.confuse.df <- do.call(rbind.data.frame, prop.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of prop
+prop.confuse.df$TPR <- prop.confuse.df$TP/(prop.confuse.df$TP + prop.confuse.df$FN)
+prop.confuse.df$TNR <- prop.confuse.df$TN/(prop.confuse.df$FP + prop.confuse.df$TN)
+prop.confuse.df$FNR <- prop.confuse.df$FN/(prop.confuse.df$TP + prop.confuse.df$FN)
+prop.confuse.df$FDR <- prop.confuse.df$FP/(prop.confuse.df$TP + prop.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+prop.mean.df <- prop.res.df[prop.res.df$Sig, ] %>% group_by(Block, prop) %>%
+  summarise(mean(logFC))
+
+prop.var.df <- prop.res.df[prop.res.df$Sig, ] %>% group_by(Block, prop) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying prop using some of the measures defined by a confusion matrix, i.e. TPR, FPR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=8.95}
+prop.confuse.melt <- melt(prop.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'Prop'))
+colnames(prop.confuse.melt) <- c("TP", "FP", "TN", "FN", "Propval", "Measure", "Value")
+prop.confuse.melt$Kval <- ordered(prop.confuse.melt$Propval,
+                                  levels=prop.vec)
+
+ggplot(prop.confuse.melt, 
+       aes(x=Propval, y=Value, fill=Measure)) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_cowplot() + 
+  scale_fill_aaas() +
+  facet_wrap(~Measure, scales="free")  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="Sample proportion", y="Measure") +
+  NULL
+```
+
+It looks like a sampling proportion of ~0.3 for this data set provides a balance between power and false discoveries with a small `k` and `d`. 
+
+What is the impact of the sampling proportion on nhood distances?
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+prop.stat.df$prop <- ordered(prop.stat.df$prop, levels=prop.vec)
+
+ggplot(prop.stat.df,
+       aes(x=prop, y=mean)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="Proportion", y="Mean nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+Perhaps unsurprisingly, the initial sampling proportion has very little impact on the mean nhood distance.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+ggplot(prop.stat.df,
+       aes(x=prop, y=var)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="Proportion", y="Variance nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+There's a marginal impact on the distance variance, such that the nhoods become slightly more heterogeous up to ~0.3, after which they are 
+quite similar.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+prop.ratio.df$prop <- ordered(prop.ratio.df$prop, levels=prop.vec)
+
+ggplot(prop.ratio.df,
+       aes(x=prop, y=DistRatio)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="Proportion", y="Nhood distance ratio") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+The distance ratio also increases slightly and appears to stabilise ~0.2-0.3; this might indicate this ratio is a good way to select a 
+good nhood coverage.
+
+
+## Simulated linear trjectory
+
+As with the discrete simulation, the simulated linear trajectory contains a fixed number of genes, so I won't perform HVG selection on these -
+I'll leave that for the real-world data with and without synthetic labels.
+
+```{r, warning=FALSE}
+traj.milo <- Milo(sim_trajectory$SCE)
+traj.meta <- sim_trajectory$meta
+
+colData(traj.milo)$Condition <- traj.meta$Condition
+colData(traj.milo)$group_id <- traj.meta$group_id
+colData(traj.milo)$Sample <- traj.meta$Sample
+colData(traj.milo)$Replicate <- traj.meta$Replicate
+```
+
+For these data we know the ground truth, i.e. which clusters are DA, and we know the magnitude of this difference.
+
+```{r}
+table(traj.milo$Sample, traj.milo$group_id)
+```
+
+The cells are split into 3 groups along the trajectories, one of which ('M2') is DA between conditions ('A' & 'B').
+
+### The impact of varying `k`
+
+We want to test how robust the Milo DA analysis is to detecting the a) the DA region and b) accurately estimating the fold-change when we 
+have differently structured graph based on computing the distances. I will fix `d=20` and `props=0.2`.
+
+```{r, message=FALSE}
+k.vec <- c(5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100)
+tp.cells <- unique(colnames(traj.milo[,traj.milo$group_id %in% c("M2")]))
+tn.cells <- unique(c(colnames(traj.milo[,traj.milo$group_id %in% c("M1")]), colnames(traj.milo[,traj.milo$group_id %in% c("M3")])))
+
+d <- 20
+props <- 0.2
+
+traj.test.meta <- data.frame("Sample"=unique(traj.milo$Sample))
+traj.test.meta$Condition <- gsub(traj.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\1")
+traj.test.meta$Replicate <- gsub(traj.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\2")
+rownames(traj.test.meta) <- traj.test.meta$Sample
+
+k.res.list <- list()
+k.confuse.list <- list()
+for(i in seq_along(k.vec)){
+  k <- k.vec[i]
+  i.milo <- buildGraph(traj.milo, k=k, d=d, reduced.dim="PCA")
+  i.milo <- makeNhoods(i.milo, k=k, d=d, prop=props, refined=TRUE)
+  i.milo <- countCells(i.milo, samples="Sample", meta.data=as.data.frame(colData(i.milo)))
+  i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+  k.stat <- nhoodSummary(i.milo)
+  k.stat$k <- k
+  k.stat.list[[paste0(k)]] <- k.stat
+  k.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+  k.ratio$k <- k
+  colnames(k.ratio) <- c("DistRatio", "k")
+  k.ratio.list[[paste0(k)]] <- k.ratio
+  
+  i.res <- testNhoods(i.milo, design.df=traj.test.meta, design=~Condition, fdr.weighting="k-distance")
+  i.res <- annotateNhoods(i.milo, coldata_col="group_id", da.res=i.res)
+  
+  i.res$k <- k
+  k.res.list[[paste0(k)]] <- i.res
+  
+  i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1]], 1, FUN=function(X) any(X> 0))])
+  
+  k.tp <- length(intersect(tp.cells, i.da))
+  k.fp <- length(intersect(tn.cells, i.da))
+  k.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+  k.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+  
+  k.confuse.list[[paste0(k)]] <- data.frame("TP"=k.tp, "FP"=k.fp, "TN"=k.tn, "FN"=k.fn, "k"=k)
+}
+
+k.res.df <- do.call(rbind.data.frame, k.res.list)
+k.res.df$Sig <- k.res.df$SpatialFDR < 0.1
+
+k.stat.df <- do.call(rbind.data.frame, k.stat.list)
+k.ratio.df <- do.call(rbind.data.frame, k.ratio.list)
+
+k.confuse.df <- do.call(rbind.data.frame, k.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of k
+k.confuse.df$TPR <- k.confuse.df$TP/(k.confuse.df$TP + k.confuse.df$FN)
+k.confuse.df$TNR <- k.confuse.df$TN/(k.confuse.df$FP + k.confuse.df$TN)
+k.confuse.df$FNR <- k.confuse.df$FN/(k.confuse.df$TP + k.confuse.df$FN)
+k.confuse.df$FDR <- k.confuse.df$FP/(k.confuse.df$TP + k.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+k.mean.df <- k.res.df[k.res.df$Sig, ] %>% group_by(group_id, k) %>%
+  summarise(mean(logFC))
+
+k.var.df <- k.res.df[k.res.df$Sig, ] %>% group_by(group_id, k) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying k using some of the measures defined by a confusion matrix, i.e. TPR, FPR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=8.95}
+k.confuse.melt <- melt(k.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'k'))
+colnames(k.confuse.melt) <- c("TP", "FP", "TN", "FN", "Kval", "Measure", "Value")
+k.confuse.melt$Kval <- ordered(k.confuse.melt$Kval,
+                               levels=k.vec)
+
+ggplot(k.confuse.melt, 
+       aes(x=Kval, y=Value, fill=Measure)) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_cowplot() + 
+  scale_fill_aaas() +
+  facet_wrap(~Measure, scales="free")  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="k", y="Measure") +
+  NULL
+```
+
+For the linear trajectorty example with a fixed `d=20` and `prop=0.2`, there is a trade-off for `k`, such that $k=20$ controls the FDR and 
+power fairly well.
+
+How doe the neighbourhood distances vary across different k values?
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+k.stat.df$k <- ordered(k.stat.df$k, levels=k.vec)
+
+ggplot(k.stat.df,
+       aes(x=k, y=mean)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="K", y="Mean nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+So the mean nhood distance increases slowly with higher `k`. Not really a clear point at which to select a value from this.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+ggplot(k.stat.df,
+       aes(x=k, y=var)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="K", y="Variance nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+That's interesting - the variances go down, but then start to increase past a certain point. This might suggest that the neighbourhoods are 
+encompassing too large a region of the graph. In which case selecting `k` such that the nhood distance variance is minimised might be a good 
+selection criteria. It does however require building a graph and neighbourhoods for many values of `k`, which is less than optimal.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+k.ratio.df$k <- ordered(k.ratio.df$k, levels=k.vec)
+
+ggplot(k.ratio.df,
+       aes(x=k, y=DistRatio)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="K", y="Nhood distance ratio") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+This shows a similar pattern of increasing ratio with `k`. It's hard to discern if this is super-useful from these plots alone. Maybe at k~20 
+there is a slight flattening off. Does that indicate a good value of `k` for this data set?
+
+### The impact of varying `d`
+
+Now we have seen the impact of varying `k`, I will vary `d` from 2 to 50 and fix `k=20`.
+
+```{r, message=FALSE, warning=FALSE}
+d.vec <- c(2, 3, 4, 5, 6, 7, 10, 12, 15, 18, 20, 25, 30, 35, 40, 45, 50)
+tp.cells <- unique(colnames(traj.milo[,traj.milo$group_id %in% c("M2")]))
+tn.cells <- unique(c(colnames(traj.milo[,traj.milo$group_id %in% c("M1")]), colnames(traj.milo[,traj.milo$group_id %in% c("M3")])))
+
+k <- 20
+props <- 0.2
+
+traj.test.meta <- data.frame("Sample"=unique(traj.milo$Sample))
+traj.test.meta$Condition <- gsub(traj.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\1")
+traj.test.meta$Replicate <- gsub(traj.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\2")
+rownames(traj.test.meta) <- traj.test.meta$Sample
+
+d.res.list <- list()
+d.confuse.list <- list()
+d.stat.list <- list()
+d.ratio.list <- list()
+for(i in seq_along(d.vec)){
+  d <- d.vec[i]
+  i.milo <- buildGraph(traj.milo, k=k, d=d, reduced.dim="PCA")
+  i.milo <- makeNhoods(i.milo, k=k, d=d, prop=props, refined=TRUE)
+  i.milo <- countCells(i.milo, samples="Sample", meta.data=as.data.frame(colData(i.milo)))
+  i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+  d.stat <- nhoodSummary(i.milo)
+  d.stat$d <- d
+  d.stat.list[[paste0(d)]] <- d.stat
+  d.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+  d.ratio$d <- d
+  colnames(d.ratio) <- c("DistRatio", "d")
+  d.ratio.list[[paste0(d)]] <- d.ratio
+  
+  i.res <- testNhoods(i.milo, design.df=traj.test.meta, design=~Condition, fdr.weighting="k-distance")
+  i.res <- annotateNhoods(i.milo, coldata_col="group_id", da.res=i.res)
+  
+  i.res$d <- d
+  d.res.list[[paste0(d)]] <- i.res
+  
+  i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1]], 1, FUN=function(X) any(X> 0))])
+  
+  d.tp <- length(intersect(tp.cells, i.da))
+  d.fp <- length(intersect(tn.cells, i.da))
+  d.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+  d.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+  
+  d.confuse.list[[paste0(d)]] <- data.frame("TP"=d.tp, "FP"=d.fp, "TN"=d.tn, "FN"=d.fn, "d"=d)
+}
+
+d.res.df <- do.call(rbind.data.frame, d.res.list)
+d.res.df$Sig <- d.res.df$SpatialFDR < 0.1
+
+d.stat.df <- do.call(rbind.data.frame, d.stat.list)
+d.ratio.df <- do.call(rbind.data.frame, d.ratio.list)
+
+d.confuse.df <- do.call(rbind.data.frame, d.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of d
+d.confuse.df$TPR <- d.confuse.df$TP/(d.confuse.df$TP + d.confuse.df$FN)
+d.confuse.df$TNR <- d.confuse.df$TN/(d.confuse.df$FP + d.confuse.df$TN)
+d.confuse.df$FNR <- d.confuse.df$FN/(d.confuse.df$TP + d.confuse.df$FN)
+d.confuse.df$FDR <- d.confuse.df$FP/(d.confuse.df$TP + d.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+d.mean.df <- d.res.df[d.res.df$Sig, ] %>% group_by(group_id, d) %>%
+  summarise(mean(logFC))
+
+d.var.df <- d.res.df[d.res.df$Sig, ] %>% group_by(group_id, d) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying d using some of the measures defined by a confusion matrix, i.e. TPR, FDR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=8.95}
+d.confuse.melt <- melt(d.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'd'))
+colnames(d.confuse.melt) <- c("TP", "FP", "TN", "FN", "Dval", "Measure", "Value")
+d.confuse.melt$Dval <- ordered(d.confuse.melt$Dval,
+                               levels=d.vec)
+
+ggplot(d.confuse.melt, 
+       aes(x=Dval, y=Value, fill=Measure)) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_cowplot() + 
+  scale_fill_aaas() +
+  facet_wrap(~Measure, scales="free")  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="Measure") +
+  NULL
+```
+
+The impact of varying d has less of a linear effect, demonstrating that each dimension captures different axes of variation in the higher 
+dimensional space. The power doesn't seem particularly impacted by varying 'd', maybe because there is a linear axis of variation describing 
+the trajectory. The FDR also indicates that a small value of `d` would be optimal, $d\leq5$.
+
+How do the neighbourhood distances vary across different d values?
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+d.stat.df$d <- ordered(d.stat.df$d, levels=d.vec)
+
+ggplot(d.stat.df,
+       aes(x=d, y=mean)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="#Dimensions", y="Mean nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+Given the fixed `k`, the mean nhood distance increases with higher `d`. That makes sense as the distance will linearly increase with a 
+linear increase in the number of dimensions. There is a slight increase in the variability with more dimensions, but it's quite subtle.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+ggplot(d.stat.df,
+       aes(x=d, y=var)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="#Dimensions", y="Variance nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+This shows that the distance variance also increases as a function of `d`, but not linearly. We can also see that more nhood are more variable 
+with a high `d`.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+d.ratio.df$d <- ordered(d.ratio.df$d, levels=d.vec)
+
+ggplot(d.ratio.df,
+       aes(x=d, y=DistRatio)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="#Dimensions", y="Nhood distance ratio") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+Now then, the ratio decreases as a function of `d`, which means the distances are converging.
+
+### The impact of co-varying `d` and `k`
+
+Now we have seen the impact of varying `k` and `d` separately I will vary `d` from 2 to 50 and vary `k` from 5 to 100.
+
+```{r, message=FALSE, warning=FALSE}
+d.vec <- c(2, 3, 4, 5, 6, 7, 10, 12, 15, 18, 20, 25, 30, 35, 40, 45, 50)
+tp.cells <- unique(colnames(traj.milo[,traj.milo$group_id %in% c("M2")]))
+tn.cells <- unique(c(colnames(traj.milo[,traj.milo$group_id %in% c("M1")]), colnames(traj.milo[,traj.milo$group_id %in% c("M3")])))
+
+props <- 0.2
+
+traj.test.meta <- data.frame("Sample"=unique(traj.milo$Sample))
+traj.test.meta$Condition <- gsub(traj.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\1")
+traj.test.meta$Replicate <- gsub(traj.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\2")
+rownames(traj.test.meta) <- traj.test.meta$Sample
+
+kd.res.list <- list()
+kd.confuse.list <- list()
+kd.stat.list <- list()
+kd.ratio.list <- list()
+for(i in seq_along(d.vec)){
+  d <- d.vec[i]
+  for(j in seq_along(k.vec)){
+    k <- k.vec[j]
+    i.milo <- buildGraph(traj.milo, k=k, d=d, reduced.dim="PCA")
+    i.milo <- makeNhoods(i.milo, k=k, d=d, prop=props, refined=TRUE)
+    i.milo <- countCells(i.milo, samples="Sample", meta.data=as.data.frame(colData(i.milo)))
+    i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+    kd.stat <- nhoodSummary(i.milo)
+    kd.stat$d <- d
+    kd.stat$k <- k
+    kd.stat.list[[paste0(k,d)]] <- kd.stat
+    kd.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+    kd.ratio$d <- d
+    kd.ratio$k <- k
+    colnames(kd.ratio) <- c("DistRatio", "d", "k")
+    kd.ratio.list[[paste0(k,d)]] <- kd.ratio
+  
+    i.res <- testNhoods(i.milo, design.df=traj.test.meta, design=~Condition, fdr.weighting="k-distance")
+    i.res <- annotateNhoods(i.milo, coldata_col="group_id", da.res=i.res)
+    
+    i.res$d <- d
+    i.res$k <- k
+    kd.res.list[[paste0(k,d)]] <- i.res
+    
+    i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1]], 1, FUN=function(X) any(X> 0))])
+    
+    d.tp <- length(intersect(tp.cells, i.da))
+    d.fp <- length(intersect(tn.cells, i.da))
+    d.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+    d.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+    
+    kd.confuse.list[[paste0(k,d)]] <- data.frame("TP"=d.tp, "FP"=d.fp, "TN"=d.tn, "FN"=d.fn, "d"=d, "k"=k)
+  }
+}
+
+kd.res.df <- do.call(rbind.data.frame, kd.res.list)
+kd.res.df$Sig <- kd.res.df$SpatialFDR < 0.1
+
+kd.stat.df <- do.call(rbind.data.frame, kd.stat.list)
+kd.ratio.df <- do.call(rbind.data.frame, kd.ratio.list)
+
+kd.confuse.df <- do.call(rbind.data.frame, kd.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of d
+kd.confuse.df$TPR <- kd.confuse.df$TP/(kd.confuse.df$TP + kd.confuse.df$FN)
+kd.confuse.df$TNR <- kd.confuse.df$TN/(kd.confuse.df$FP + kd.confuse.df$TN)
+kd.confuse.df$FNR <- kd.confuse.df$FN/(kd.confuse.df$TP + kd.confuse.df$FN)
+kd.confuse.df$FDR <- kd.confuse.df$FP/(kd.confuse.df$TP + kd.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+kd.mean.df <- kd.res.df[kd.res.df$Sig, ] %>% group_by(group_id, d, k) %>%
+  summarise(mean(logFC))
+
+kd.var.df <- kd.res.df[kd.res.df$Sig, ] %>% group_by(group_id, d, k) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying d using some of the measures defined by a confusion matrix, i.e. TPR, FPR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+kd.confuse.melt <- melt(kd.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'd', 'k'))
+colnames(kd.confuse.melt) <- c("TP", "FP", "TN", "FN", "Dval", "Kval", "Measure", "Value")
+kd.confuse.melt$Dval <- ordered(kd.confuse.melt$Dval,
+                                levels=d.vec)
+kd.confuse.melt$Kval <- ordered(kd.confuse.melt$Kval,
+                                levels=k.vec)
+
+
+ggplot(kd.confuse.melt[kd.confuse.melt$Measure %in% c("TPR"), ], 
+       aes(x=Dval, y=Kval, fill=Value)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis() +
+  facet_wrap(~Measure)  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+This grid shows the TPR as a function of the number input dimensions and `k`. It seems that this is almost an ideal situation for Milo as 
+the power is very high across the space with $k\geq10$.
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.confuse.melt[kd.confuse.melt$Measure %in% c("FDR"), ], 
+       aes(x=Dval, y=Kval, fill=Value)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=-1) +
+  facet_wrap(~Measure)  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+This shows the FDR as a function of the number of PCs and `k`. For this linear trajectory $k\leq20$ has the best FDR control with a small 
+number of input directions. I'll plott the leading PC eigenvalues to determine the optimal number.
+
+```{r, warning=FALSE, message=FALSE}
+dis.pca <- prcomp_irlba(t(logcounts(traj.milo)), n=50)
+plot(dis.pca$sdev)
+```
+In this case there are 2 large PCs, but we must have $\gt2$ dimensions, so I'll use 3.
+
+How do the distance measures co-vary with `d` and `k`? I'll average over each pair of k and d values.
+
+```{r, warning=FALSE, message=FALSE}
+# calculate the mean and variance distances and ratios
+kd.stat.mean.df <- kd.stat.df %>% group_by(d, k) %>%
+  summarise(mean(mean))
+colnames(kd.stat.mean.df) <- c("d", "k", "Mean")
+kd.stat.mean.df$d <- ordered(kd.stat.mean.df$d, levels=d.vec)
+kd.stat.mean.df$k <- ordered(kd.stat.mean.df$k, levels=k.vec)
+
+kd.stat.var.df <- kd.stat.df %>% group_by(d, k) %>%
+  summarise(mean(var))
+colnames(kd.stat.var.df) <- c("d", "k", "Var")
+kd.stat.var.df$d <- ordered(kd.stat.var.df$d, levels=d.vec)
+kd.stat.var.df$k <- ordered(kd.stat.var.df$k, levels=k.vec)
+
+kd.ratio.mean.df <- kd.ratio.df %>% group_by(d, k) %>%
+  summarise(mean(DistRatio))
+colnames(kd.ratio.mean.df) <- c("d", "k", "DistRatio")
+kd.ratio.mean.df$d <- ordered(kd.ratio.mean.df$d, levels=d.vec)
+kd.ratio.mean.df$k <- ordered(kd.ratio.mean.df$k, levels=k.vec)
+```
+
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.stat.mean.df, 
+       aes(x=d, y=k, fill=Mean)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=1) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+This is the average of the mean nhood distances. Not an especially interesting relationship between `k` and `d` in this respect. It looks 
+almost identical to the discrete cluster simulation.
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.stat.var.df, 
+       aes(x=d, y=k, fill=Var)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=1) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+The average distance variance is generally pretty low. It's only for extreme value of `k` where it is dramatically different. This might 
+indicate that for a simple linear trajectory the distances are pretty stable; a reflection of the uniform density across the simulated 
+trajectory than anything about Milo _per se_.
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.ratio.mean.df, 
+       aes(x=d, y=k, fill=log(DistRatio))) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=1) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+I think any variation in the distance ratio is masked by the scale, so I've transformed it to a log-scale. Even then we can see that high 
+values of `k` have a disproportionate impact with a small number of dimensions.
+
+### The impact of varying `prop`
+
+Finally, what effect does varying the initial sampling proportion have? I will fix k=20 and d=3 for this.
+
+```{r, message=FALSE, warning=FALSE}
+prop.vec <- c(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+tp.cells <- unique(colnames(traj.milo[,traj.milo$group_id %in% c("M2")]))
+tn.cells <- unique(c(colnames(traj.milo[,traj.milo$group_id %in% c("M1")]), colnames(traj.milo[,traj.milo$group_id %in% c("M3")])))
+
+d <- 3
+k <- 20
+
+traj.test.meta <- data.frame("Sample"=unique(traj.milo$Sample))
+traj.test.meta$Condition <- gsub(traj.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\1")
+traj.test.meta$Replicate <- gsub(traj.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\2")
+rownames(traj.test.meta) <- traj.test.meta$Sample
+
+prop.res.list <- list()
+prop.confuse.list <- list()
+prop.stat.list <- list()
+prop.ratio.list <- list()
+for(i in seq_along(prop.vec)){
+  prop <- prop.vec[i]
+  i.milo <- buildGraph(traj.milo, k=k, d=d, reduced.dim="PCA")
+  i.milo <- makeNhoods(i.milo, k=k, d=d, prop=prop, refined=TRUE)
+  i.milo <- countCells(i.milo, samples="Sample", meta.data=as.data.frame(colData(i.milo)))
+  i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+  prop.stat <- nhoodSummary(i.milo)
+  prop.stat$prop <- prop
+  prop.stat.list[[paste0(prop)]] <- prop.stat
+  prop.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+  prop.ratio$prop <- prop
+  colnames(prop.ratio) <- c("DistRatio", "prop")
+  prop.ratio.list[[paste0(prop)]] <- prop.ratio
+  
+  i.res <- testNhoods(i.milo, design.df=traj.test.meta, design=~Condition, fdr.weighting="k-distance")
+  i.res <- annotateNhoods(i.milo, coldata_col="group_id", da.res=i.res)
+  
+  i.res$prop <- prop
+  prop.res.list[[paste0(prop)]] <- i.res
+  
+  i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1]], 1, FUN=function(X) any(X> 0))])
+  
+  prop.tp <- length(intersect(tp.cells, i.da))
+  prop.fp <- length(intersect(tn.cells, i.da))
+  prop.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+  prop.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+  
+  prop.confuse.list[[paste0(prop)]] <- data.frame("TP"=prop.tp, "FP"=prop.fp, "TN"=prop.tn, "FN"=prop.fn, "Prop"=prop)
+}
+
+prop.res.df <- do.call(rbind.data.frame, prop.res.list)
+prop.res.df$Sig <- prop.res.df$SpatialFDR < 0.1
+
+prop.stat.df <- do.call(rbind.data.frame, prop.stat.list)
+prop.ratio.df <- do.call(rbind.data.frame, prop.ratio.list)
+
+prop.confuse.df <- do.call(rbind.data.frame, prop.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of prop
+prop.confuse.df$TPR <- prop.confuse.df$TP/(prop.confuse.df$TP + prop.confuse.df$FN)
+prop.confuse.df$TNR <- prop.confuse.df$TN/(prop.confuse.df$FP + prop.confuse.df$TN)
+prop.confuse.df$FNR <- prop.confuse.df$FN/(prop.confuse.df$TP + prop.confuse.df$FN)
+prop.confuse.df$FDR <- prop.confuse.df$FP/(prop.confuse.df$TP + prop.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+prop.mean.df <- prop.res.df[prop.res.df$Sig, ] %>% group_by(group_id, prop) %>%
+  summarise(mean(logFC))
+
+prop.var.df <- prop.res.df[prop.res.df$Sig, ] %>% group_by(group_id, prop) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying prop using some of the measures defined by a confusion matrix, i.e. TPR, FPR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=8.95}
+prop.confuse.melt <- melt(prop.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'Prop'))
+colnames(prop.confuse.melt) <- c("TP", "FP", "TN", "FN", "Propval", "Measure", "Value")
+prop.confuse.melt$Kval <- ordered(prop.confuse.melt$Propval,
+                                  levels=prop.vec)
+
+ggplot(prop.confuse.melt, 
+       aes(x=Propval, y=Value, fill=Measure)) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_cowplot() + 
+  scale_fill_aaas() +
+  facet_wrap(~Measure, scales="free")  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="Sample proportion", y="Measure") +
+  NULL
+```
+
+It looks like a sampling proportion of 0.3-0.4 for this data set provides a balance between power and false discoveries with a small `k` and 
+`d`.
+
+
+What is the impact of the sampling proportion on nhood distances?
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+prop.stat.df$prop <- ordered(prop.stat.df$prop, levels=prop.vec)
+
+ggplot(prop.stat.df,
+       aes(x=prop, y=mean)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="Proportion", y="Mean nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+Perhaps unsurprisingly, the initial sampling proportion has very little impact on the mean nhood distance above a sensible value, e.g. 
+$\geq0.05$.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+ggplot(prop.stat.df,
+       aes(x=prop, y=var)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="Proportion", y="Variance nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+There's a marginal impact on the distance variance, such that the nhoods become slightly more heterogeous above 0.05, after which they are 
+quite similar.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+prop.ratio.df$prop <- ordered(prop.ratio.df$prop, levels=prop.vec)
+
+ggplot(prop.ratio.df,
+       aes(x=prop, y=DistRatio)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="Proportion", y="Nhood distance ratio") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+The distance ratio also increases slightly and appears to stabilise ~0.2-0.3; this might indicate this ratio is a good way to select a 
+good nhood coverage.
+
+
+Strikingly, Milo is more performant in the linear trajectory case than the multiple discrete clusters. This is probably reflected by one of 
+the DA discrete clusters being very poorly separated from a larger non-DA cluster.
+
+## Simulated branching trjectory
+
+I've generated a simulation of a branching trajectory using `dyngen` and injected 2 DA regions, again based on a simple 
+pair-wise experimental design.
+
+```{r, warning=FALSE}
+branch_trajectory <- readRDS("~/Dropbox/Milo/simulations/data/BranchingSimulation.RDS")
+branch.milo <- Milo(branch_trajectory$sce)
+branch.meta <- branch_trajectory$meta
+```
+
+For these data we know the ground truth, i.e. which clusters are DA, and we know the magnitude of this difference.
+
+```{r}
+table(branch.milo$Sample, branch.milo$group_id)
+```
+
+The cells are split into 10 groups along the trajectories, two of which ('M5' and 'M8') are DA between conditions 
+('A' & 'B').
+
+### The impact of varying `k`
+
+We want to test how robust the Milo DA analysis is to detecting the a) the DA region and b) accurately estimating the 
+fold-change when we have differently structured graph based on computing the distances. I will fix `d=20` and 
+`props=0.2`.
+
+```{r, message=FALSE}
+k.vec <- c(5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100)
+tp.cells <- unique(colnames(branch.milo[,branch.milo$group_id %in% c("M5", "M8")]))
+tn.cells <- colnames(branch.milo[,!branch.milo$group_id %in% c("M5", "M8")])
+
+d <- 20
+props <- 0.2
+
+branch.test.meta <- data.frame("Sample"=unique(branch.milo$Sample))
+branch.test.meta$Condition <- gsub(branch.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\1")
+branch.test.meta$Replicate <- gsub(branch.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\2")
+rownames(branch.test.meta) <- branch.test.meta$Sample
+
+k.res.list <- list()
+k.confuse.list <- list()
+k.stat.list <- list()
+k.ratio.list <- list()
+for(i in seq_along(k.vec)){
+  k <- k.vec[i]
+  i.milo <- buildGraph(branch.milo, k=k, d=d, reduced.dim="PCA")
+  i.milo <- makeNhoods(i.milo, k=k, d=d, prop=props, refined=TRUE)
+  i.milo <- countCells(i.milo, samples="Sample", meta.data=as.data.frame(colData(i.milo)))
+  i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+  k.stat <- nhoodSummary(i.milo)
+  k.stat$k <- k
+  k.stat.list[[paste0(k)]] <- k.stat
+  k.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+  k.ratio$k <- k
+  colnames(k.ratio) <- c("DistRatio", "k")
+  k.ratio.list[[paste0(k)]] <- k.ratio
+  
+  i.res <- testNhoods(i.milo, design.df=branch.test.meta, design=~Condition, fdr.weighting="k-distance")
+  i.res <- annotateNhoods(i.milo, coldata_col="group_id", da.res=i.res)
+  
+  i.res$k <- k
+  k.res.list[[paste0(k)]] <- i.res
+  
+  i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1]], 1, FUN=function(X) any(X> 0))])
+  
+  k.tp <- length(intersect(tp.cells, i.da))
+  k.fp <- length(intersect(tn.cells, i.da))
+  k.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+  k.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+  
+  k.confuse.list[[paste0(k)]] <- data.frame("TP"=k.tp, "FP"=k.fp, "TN"=k.tn, "FN"=k.fn, "k"=k)
+}
+
+k.res.df <- do.call(rbind.data.frame, k.res.list)
+k.res.df$Sig <- k.res.df$SpatialFDR < 0.1
+
+k.stat.df <- do.call(rbind.data.frame, k.stat.list)
+k.ratio.df <- do.call(rbind.data.frame, k.ratio.list)
+
+k.confuse.df <- do.call(rbind.data.frame, k.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of k
+k.confuse.df$TPR <- k.confuse.df$TP/(k.confuse.df$TP + k.confuse.df$FN)
+k.confuse.df$TNR <- k.confuse.df$TN/(k.confuse.df$FP + k.confuse.df$TN)
+k.confuse.df$FNR <- k.confuse.df$FN/(k.confuse.df$TP + k.confuse.df$FN)
+k.confuse.df$FDR <- k.confuse.df$FP/(k.confuse.df$TP + k.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+k.mean.df <- k.res.df[k.res.df$Sig, ] %>% group_by(group_id, k) %>%
+  summarise(mean(logFC))
+
+k.var.df <- k.res.df[k.res.df$Sig, ] %>% group_by(group_id, k) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying k using some of the measures defined by a confusion matrix, i.e. TPR, FPR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=8.95}
+k.confuse.melt <- melt(k.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'k'))
+colnames(k.confuse.melt) <- c("TP", "FP", "TN", "FN", "Kval", "Measure", "Value")
+k.confuse.melt$Kval <- ordered(k.confuse.melt$Kval,
+                               levels=k.vec)
+
+ggplot(k.confuse.melt, 
+       aes(x=Kval, y=Value, fill=Measure)) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_cowplot() + 
+  scale_fill_aaas() +
+  facet_wrap(~Measure, scales="free")  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="k", y="Measure") +
+  NULL
+```
+
+The power is pretty high from $k\geq15$, but the FDR is somewhat inflated. I'm not sure how much this is due to the complexities of the 
+branching trajectory, and how much is down to the cell-wise FDR giving the appearance of worse type I error control.
+
+How do the neighbourhood distances vary across different k values in the branching trajectory.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+k.stat.df$k <- ordered(k.stat.df$k, levels=k.vec)
+
+ggplot(k.stat.df,
+       aes(x=k, y=mean)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="K", y="Mean nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+So the mean nhood distance increases with `k`. As with the linear trajectory, there isn't really a clear point at which to select a value 
+from this.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+ggplot(k.stat.df,
+       aes(x=k, y=var)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="K", y="Variance nhood distance") +
+  expand_limits(y=c(0)) +
+  scale_y_log10() +
+  NULL
+```
+
+The nhood distance variances decrease with higher `k`, but the spread of variances also increases with very high values of `k`.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+k.ratio.df$k <- ordered(k.ratio.df$k, levels=k.vec)
+
+ggplot(k.ratio.df,
+       aes(x=k, y=DistRatio)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="K", y="Nhood distance ratio") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+This shows a similar pattern of increasing ratio with `k` as the mean nhood distance. This shows that the neighbourhoods are getting more 
+and more heterogeneous.
+
+### The impact of varying `d`
+
+Now we have seen the impact of varying `k`, I will vary `d` from 2 to 50 and fix `k=20`.
+
+```{r, message=FALSE, warning=FALSE}
+d.vec <- c(2, 3, 4, 5, 6, 7, 10, 12, 15, 18, 20, 25, 30, 35, 40, 45, 50)
+tp.cells <- unique(colnames(branch.milo[,branch.milo$group_id %in% c("M5", "M8")]))
+tn.cells <- colnames(branch.milo[,!branch.milo$group_id %in% c("M5", "M8")])
+
+k <- 20
+props <- 0.2
+
+branch.test.meta <- data.frame("Sample"=unique(branch.milo$Sample))
+branch.test.meta$Condition <- gsub(branch.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\1")
+branch.test.meta$Replicate <- gsub(branch.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\2")
+rownames(branch.test.meta) <- branch.test.meta$Sample
+
+d.res.list <- list()
+d.confuse.list <- list()
+d.stat.list <- list()
+d.ratio.list <- list()
+for(i in seq_along(d.vec)){
+  d <- d.vec[i]
+  i.milo <- buildGraph(branch.milo, k=k, d=d, reduced.dim="PCA")
+  i.milo <- makeNhoods(i.milo, k=k, d=d, prop=props, refined=TRUE)
+  i.milo <- countCells(i.milo, samples="Sample", meta.data=as.data.frame(colData(i.milo)))
+  i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+  d.stat <- nhoodSummary(i.milo)
+  d.stat$d <- d
+  d.stat.list[[paste0(d)]] <- d.stat
+  d.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+  d.ratio$d <- d
+  colnames(d.ratio) <- c("DistRatio", "d")
+  d.ratio.list[[paste0(d)]] <- d.ratio
+  
+  i.res <- testNhoods(i.milo, design.df=branch.test.meta, design=~Condition, fdr.weighting="k-distance")
+  i.res <- annotateNhoods(i.milo, coldata_col="group_id", da.res=i.res)
+  
+  i.res$d <- d
+  d.res.list[[paste0(d)]] <- i.res
+  
+  i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1]], 1, FUN=function(X) any(X> 0))])
+  
+  d.tp <- length(intersect(tp.cells, i.da))
+  d.fp <- length(intersect(tn.cells, i.da))
+  d.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+  d.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+  
+  d.confuse.list[[paste0(d)]] <- data.frame("TP"=d.tp, "FP"=d.fp, "TN"=d.tn, "FN"=d.fn, "d"=d)
+}
+
+d.res.df <- do.call(rbind.data.frame, d.res.list)
+d.res.df$Sig <- d.res.df$SpatialFDR < 0.1
+
+d.stat.df <- do.call(rbind.data.frame, d.stat.list)
+d.ratio.df <- do.call(rbind.data.frame, d.ratio.list)
+
+d.confuse.df <- do.call(rbind.data.frame, d.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of d
+d.confuse.df$TPR <- d.confuse.df$TP/(d.confuse.df$TP + d.confuse.df$FN)
+d.confuse.df$TNR <- d.confuse.df$TN/(d.confuse.df$FP + d.confuse.df$TN)
+d.confuse.df$FNR <- d.confuse.df$FN/(d.confuse.df$TP + d.confuse.df$FN)
+d.confuse.df$FDR <- d.confuse.df$FP/(d.confuse.df$TP + d.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+d.mean.df <- d.res.df[d.res.df$Sig, ] %>% group_by(group_id, d) %>%
+  summarise(mean(logFC))
+
+d.var.df <- d.res.df[d.res.df$Sig, ] %>% group_by(group_id, d) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying d using some of the measures defined by a confusion matrix, i.e. TPR, FDR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=8.95}
+d.confuse.melt <- melt(d.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'd'))
+colnames(d.confuse.melt) <- c("TP", "FP", "TN", "FN", "Dval", "Measure", "Value")
+d.confuse.melt$Dval <- ordered(d.confuse.melt$Dval,
+                               levels=d.vec)
+
+ggplot(d.confuse.melt, 
+       aes(x=Dval, y=Value, fill=Measure)) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_cowplot() + 
+  scale_fill_aaas() +
+  facet_wrap(~Measure, scales="free")  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="Measure") +
+  NULL
+```
+
+The impact of varying d has less of a linear effect, demonstrating that each dimension captures different axes of variation in the higher 
+dimensional space. The power is fairly consistent across the board, as is the FDR (albeit too high), indicating that `k` has a much 
+larger impact on power and FDR than the number of dimensions for this dataset.
+
+How do the neighbourhood distances vary across different d values?
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+d.stat.df$d <- ordered(d.stat.df$d, levels=d.vec)
+
+ggplot(d.stat.df,
+       aes(x=d, y=mean)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="#Dimensions", y="Mean nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+Given the fixed `k`, the mean nhood distance increases with higher `d`. That makes sense as the distance will linearly increase with a 
+linear increase in the number of dimensions.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+ggplot(d.stat.df,
+       aes(x=d, y=var)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="#Dimensions", y="Variance nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+This shows that the distance variance also increases slightly as a function of `d`, but not linearly. Across all values of `d` there are a 
+subset of highly variable nhoods.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+d.ratio.df$d <- ordered(d.ratio.df$d, levels=d.vec)
+
+ggplot(d.ratio.df,
+       aes(x=d, y=DistRatio)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="#Dimensions", y="Nhood distance ratio") +
+  expand_limits(y=c(0)) +
+  scale_y_log10() +
+  NULL
+```
+
+Now then, the ratio decreases as a function of `d`, which means the distances are converging. This is what we would expect from any distance 
+measure as the dimensionality increases.
+
+### The impact of co-varying `d` and `k`
+
+Now we have seen the impact of varying `k` and `d` separately I will vary `d` from 2 to 50 and vary `k` from 5 to 100.
+
+```{r, message=FALSE, warning=FALSE}
+d.vec <- c(2, 3, 4, 5, 6, 7, 10, 12, 15, 18, 20, 25, 30, 35, 40, 45, 50)
+tp.cells <- unique(colnames(branch.milo[,branch.milo$group_id %in% c("M5", "M8")]))
+tn.cells <- colnames(branch.milo[,!branch.milo$group_id %in% c("M5", "M8")])
+
+props <- 0.2
+
+branch.test.meta <- data.frame("Sample"=unique(branch.milo$Sample))
+branch.test.meta$Condition <- gsub(branch.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\1")
+branch.test.meta$Replicate <- gsub(branch.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\2")
+rownames(branch.test.meta) <- branch.test.meta$Sample
+
+kd.res.list <- list()
+kd.confuse.list <- list()
+kd.stat.list <- list()
+kd.ratio.list <- list()
+for(i in seq_along(d.vec)){
+  d <- d.vec[i]
+  for(j in seq_along(k.vec)){
+    k <- k.vec[j]
+    i.milo <- buildGraph(branch.milo, k=k, d=d, reduced.dim="PCA")
+    i.milo <- makeNhoods(i.milo, k=k, d=d, prop=props, refined=TRUE)
+    i.milo <- countCells(i.milo, samples="Sample", meta.data=as.data.frame(colData(i.milo)))
+    i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+    kd.stat <- nhoodSummary(i.milo)
+    kd.stat$d <- d
+    kd.stat$k <- k
+    kd.stat.list[[paste0(k,d)]] <- kd.stat
+    kd.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+    kd.ratio$d <- d
+    kd.ratio$k <- k
+    colnames(kd.ratio) <- c("DistRatio", "d", "k")
+    kd.ratio.list[[paste0(k,d)]] <- kd.ratio
+  
+    i.res <- testNhoods(i.milo, design.df=branch.test.meta, design=~Condition, fdr.weighting="k-distance")
+    i.res <- annotateNhoods(i.milo, coldata_col="group_id", da.res=i.res)
+    
+    i.res$d <- d
+    i.res$k <- k
+    kd.res.list[[paste0(k,d)]] <- i.res
+    
+    i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1], drop=FALSE], 1, FUN=function(X) any(X> 0))])
+    
+    d.tp <- length(intersect(tp.cells, i.da))
+    d.fp <- length(intersect(tn.cells, i.da))
+    d.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+    d.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+    
+    kd.confuse.list[[paste0(k,d)]] <- data.frame("TP"=d.tp, "FP"=d.fp, "TN"=d.tn, "FN"=d.fn, "d"=d, "k"=k)
+  }
+}
+
+kd.res.df <- do.call(rbind.data.frame, kd.res.list)
+kd.res.df$Sig <- kd.res.df$SpatialFDR < 0.1
+
+kd.stat.df <- do.call(rbind.data.frame, kd.stat.list)
+kd.ratio.df <- do.call(rbind.data.frame, kd.ratio.list)
+
+kd.confuse.df <- do.call(rbind.data.frame, kd.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of d
+kd.confuse.df$TPR <- kd.confuse.df$TP/(kd.confuse.df$TP + kd.confuse.df$FN)
+kd.confuse.df$TNR <- kd.confuse.df$TN/(kd.confuse.df$FP + kd.confuse.df$TN)
+kd.confuse.df$FNR <- kd.confuse.df$FN/(kd.confuse.df$TP + kd.confuse.df$FN)
+kd.confuse.df$FDR <- kd.confuse.df$FP/(kd.confuse.df$TP + kd.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+kd.mean.df <- kd.res.df[kd.res.df$Sig, ] %>% group_by(group_id, d, k) %>%
+  summarise(mean(logFC))
+
+kd.var.df <- kd.res.df[kd.res.df$Sig, ] %>% group_by(group_id, d, k) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying d using some of the measures defined by a confusion matrix, i.e. TPR, FPR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+kd.confuse.melt <- melt(kd.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'd', 'k'))
+colnames(kd.confuse.melt) <- c("TP", "FP", "TN", "FN", "Dval", "Kval", "Measure", "Value")
+kd.confuse.melt$Dval <- ordered(kd.confuse.melt$Dval,
+                                levels=d.vec)
+kd.confuse.melt$Kval <- ordered(kd.confuse.melt$Kval,
+                                levels=k.vec)
+
+
+ggplot(kd.confuse.melt[kd.confuse.melt$Measure %in% c("TPR"), ], 
+       aes(x=Dval, y=Kval, fill=Value)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis() +
+  facet_wrap(~Measure)  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+This grid shows the TPR as a function of the number input dimensions and `k`. Once $k\geq20$ the power is fairly high, though a very small 
+number of dimensions does impact on this, indicating that upwards of 10 domensions might be required for these complex multifurcating 
+trajectories.
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.confuse.melt[kd.confuse.melt$Measure %in% c("FDR"), ], 
+       aes(x=Dval, y=Kval, fill=Value)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=-1) +
+  facet_wrap(~Measure)  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+Perhaps frustratingly, cell-wiseFDR is only properly controlled at sub-optimal values of `k` and `d` w.r.t. power.
+
+How do the distance measures co-vary with `d` and `k`? I'll average over each pair of k and d values.
+
+```{r, warning=FALSE, message=FALSE}
+# calculate the mean and variance distances and ratios
+kd.stat.mean.df <- kd.stat.df %>% group_by(d, k) %>%
+  summarise(mean(mean))
+colnames(kd.stat.mean.df) <- c("d", "k", "Mean")
+kd.stat.mean.df$d <- ordered(kd.stat.mean.df$d, levels=d.vec)
+kd.stat.mean.df$k <- ordered(kd.stat.mean.df$k, levels=k.vec)
+
+kd.stat.var.df <- kd.stat.df %>% group_by(d, k) %>%
+  summarise(mean(var))
+colnames(kd.stat.var.df) <- c("d", "k", "Var")
+kd.stat.var.df$d <- ordered(kd.stat.var.df$d, levels=d.vec)
+kd.stat.var.df$k <- ordered(kd.stat.var.df$k, levels=k.vec)
+
+kd.ratio.mean.df <- kd.ratio.df %>% group_by(d, k) %>%
+  summarise(mean(DistRatio))
+colnames(kd.ratio.mean.df) <- c("d", "k", "DistRatio")
+kd.ratio.mean.df$d <- ordered(kd.ratio.mean.df$d, levels=d.vec)
+kd.ratio.mean.df$k <- ordered(kd.ratio.mean.df$k, levels=k.vec)
+```
+
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.stat.mean.df, 
+       aes(x=d, y=k, fill=Mean)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=1) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+This is the average of the mean nhood distances. Not an especially interesting relationship between `k` and `d` in this respect. It looks 
+almost identical to the discrete cluster simulation, but with more dependence on `d`.
+
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.stat.var.df, 
+       aes(x=d, y=k, fill=Var)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=1) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+The average distance variance is generally pretty low. It's only for extreme value of `k` where it is dramatically different. This is similar 
+to the linear trajectory.
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.ratio.mean.df, 
+       aes(x=d, y=k, fill=log(DistRatio))) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=1) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+I think any variation in the distance ratio is masked by the scale, so I've transformed it to a log-scale. Even then we can see that the 
+combination of a high value of `k` and low value of `d` have a disproportionate impact.
+
+### The impact of varying `prop`
+
+Finally, what effect does varying the initial sampling proportion have? I will fix k=20 and d=3 for this.
+
+```{r, message=FALSE, warning=FALSE}
+prop.vec <- c(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+tp.cells <- unique(colnames(branch.milo[,branch.milo$group_id %in% c("M5", "M8")]))
+tn.cells <- colnames(branch.milo[,!branch.milo$group_id %in% c("M5", "M8")])
+
+d <- 15
+k <- 20
+
+branch.test.meta <- data.frame("Sample"=unique(branch.milo$Sample))
+branch.test.meta$Condition <- gsub(branch.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\1")
+branch.test.meta$Replicate <- gsub(branch.test.meta$Sample, pattern="([A|B])_(R[0-9])", replacement="\\2")
+rownames(branch.test.meta) <- branch.test.meta$Sample
+
+prop.res.list <- list()
+prop.confuse.list <- list()
+prop.stat.list <- list()
+prop.ratio.list <- list()
+for(i in seq_along(prop.vec)){
+  prop <- prop.vec[i]
+  i.milo <- buildGraph(branch.milo, k=k, d=d, reduced.dim="PCA")
+  i.milo <- makeNhoods(i.milo, k=k, d=d, prop=prop, refined=TRUE)
+  i.milo <- countCells(i.milo, samples="Sample", meta.data=as.data.frame(colData(i.milo)))
+  i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+  prop.stat <- nhoodSummary(i.milo)
+  prop.stat$prop <- prop
+  prop.stat.list[[paste0(prop)]] <- prop.stat
+  prop.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+  prop.ratio$prop <- prop
+  colnames(prop.ratio) <- c("DistRatio", "prop")
+  prop.ratio.list[[paste0(prop)]] <- prop.ratio
+  
+  i.res <- testNhoods(i.milo, design.df=branch.test.meta, design=~Condition, fdr.weighting="k-distance")
+  i.res <- annotateNhoods(i.milo, coldata_col="group_id", da.res=i.res)
+  
+  i.res$prop <- prop
+  prop.res.list[[paste0(prop)]] <- i.res
+  
+  i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1]], 1, FUN=function(X) any(X> 0))])
+  
+  prop.tp <- length(intersect(tp.cells, i.da))
+  prop.fp <- length(intersect(tn.cells, i.da))
+  prop.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+  prop.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+  
+  prop.confuse.list[[paste0(prop)]] <- data.frame("TP"=prop.tp, "FP"=prop.fp, "TN"=prop.tn, "FN"=prop.fn, "Prop"=prop)
+}
+
+prop.res.df <- do.call(rbind.data.frame, prop.res.list)
+prop.res.df$Sig <- prop.res.df$SpatialFDR < 0.1
+
+prop.stat.df <- do.call(rbind.data.frame, prop.stat.list)
+prop.ratio.df <- do.call(rbind.data.frame, prop.ratio.list)
+
+prop.confuse.df <- do.call(rbind.data.frame, prop.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of prop
+prop.confuse.df$TPR <- prop.confuse.df$TP/(prop.confuse.df$TP + prop.confuse.df$FN)
+prop.confuse.df$TNR <- prop.confuse.df$TN/(prop.confuse.df$FP + prop.confuse.df$TN)
+prop.confuse.df$FNR <- prop.confuse.df$FN/(prop.confuse.df$TP + prop.confuse.df$FN)
+prop.confuse.df$FDR <- prop.confuse.df$FP/(prop.confuse.df$TP + prop.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+prop.mean.df <- prop.res.df[prop.res.df$Sig, ] %>% group_by(group_id, prop) %>%
+  summarise(mean(logFC))
+
+prop.var.df <- prop.res.df[prop.res.df$Sig, ] %>% group_by(group_id, prop) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying prop using some of the measures defined by a confusion matrix, i.e. TPR, FPR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=8.95}
+prop.confuse.melt <- melt(prop.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'Prop'))
+colnames(prop.confuse.melt) <- c("TP", "FP", "TN", "FN", "Propval", "Measure", "Value")
+prop.confuse.melt$Kval <- ordered(prop.confuse.melt$Propval,
+                                  levels=prop.vec)
+
+ggplot(prop.confuse.melt, 
+       aes(x=Propval, y=Value, fill=Measure)) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_cowplot() + 
+  scale_fill_aaas() +
+  facet_wrap(~Measure, scales="free")  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="Sample proportion", y="Measure") +
+  NULL
+```
+
+It looks like a sampling proportion of 0.3-0.4 for this data set provides a balance between power and false discoveries with a small `k` and 
+`d`.
+
+What is the impact of the sampling proportion on nhood distances?
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+prop.stat.df$prop <- ordered(prop.stat.df$prop, levels=prop.vec)
+
+ggplot(prop.stat.df,
+       aes(x=prop, y=mean)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="Proportion", y="Mean nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+Perhaps unsurprisingly, the initial sampling proportion has very little impact on the mean nhood distance above a sensible value, e.g. 
+$\geq0.05$.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+ggplot(prop.stat.df,
+       aes(x=prop, y=var)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="Proportion", y="Variance nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+There's a marginal impact on the distance variance, such that the nhoods become slightly more heterogeous above 0.05, after which they are 
+quite similar.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+prop.ratio.df$prop <- ordered(prop.ratio.df$prop, levels=prop.vec)
+
+ggplot(prop.ratio.df,
+       aes(x=prop, y=DistRatio)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="Proportion", y="Nhood distance ratio") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+The distance ratio also increases slightly and appears to stabilise ~0.2-0.3; this might indicate this ratio is a good way to select a 
+good nhood coverage.
+
+## Real world data with synthetic labels
+
+These are data based on the Mouse Gastrulation atlas, but where as specific DA effect has been injected into the data.
+
+```{r, warning=FALSE}
+gastrulation_trajectory <- readRDS("~/Dropbox/Milo/simulations/data/embryo_data_bm_wMilo.RDS")
+gastrulation.meta <- as.data.frame(colData(gastrulation_trajectory))
+gastrulation.meta <- gastrulation.meta[gastrulation.meta$synth_samples %in% c(paste0("Condition1_", c("R1", "R2", "R3")),
+                                                                              paste0("Condition2_", c("R1", "R2", "R3"))), ]
+gastrulation.milo <- Milo(gastrulation_trajectory[, colnames(gastrulation_trajectory) %in% rownames(gastrulation.meta)])
+sink(file="/dev/null")
+rm(list=c("gastrulation_trajectory"))
+gc()
+sink(file=NULL)
+```
+
+For these data Emma has injected synthetic labels, which creates a ground truth to compare against for the DA testing.
+
+```{r}
+table(gastrulation.milo$synth_samples, gastrulation.milo$true_labels)
+```
+
+The cells are organised into 12 samples. For the DA testing I will only use the first 3 replicates from each condition to make this analysis 
+comparable to the other simulated data sets.
+
+### The impact of varying `k`
+
+We want to test how robust the Milo DA analysis is to detecting the a) the DA region and b) accurately estimating the 
+fold-change when we have differently structured graph based on computing the distances. I will fix `d=20` and 
+`props=0.2`.
+
+```{r, message=FALSE}
+k.vec <- c(5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100)
+tp.cells <- unique(colnames(gastrulation.milo)[gastrulation.milo$true_labels %in% c("NegLFC", "PosLFC")])
+tn.cells <- unique(colnames(gastrulation.milo)[gastrulation.milo$true_labels %in% c("NotDA")])
+
+d <- 20
+props <- 0.2
+
+gastrulation.test.meta <- data.frame("synth_samples"=unique(gastrulation.milo$synth_samples))
+gastrulation.test.meta$Condition <- gsub(gastrulation.test.meta$synth_samples, pattern="([A-Za-z0-9]+)_(R[0-9])", replacement="\\1")
+gastrulation.test.meta$Replicate <- gsub(gastrulation.test.meta$synth_samples, pattern="([A-Za-z0-9]+)_(R[0-9])", replacement="\\2")
+rownames(gastrulation.test.meta) <- gastrulation.test.meta$synth_samples
+
+k.res.list <- list()
+k.confuse.list <- list()
+k.stat.list <- list()
+k.ratio.list <- list()
+for(i in seq_along(k.vec)){
+  k <- k.vec[i]
+  i.milo <- buildGraph(gastrulation.milo, k=k, d=d, reduced.dim="PCA")
+  i.milo <- makeNhoods(i.milo, k=k, d=d, prop=props, refined=TRUE)
+  i.milo <- countCells(i.milo, samples="synth_samples", meta.data=as.data.frame(colData(i.milo)))
+  i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+  k.stat <- nhoodSummary(i.milo)
+  k.stat$k <- k
+  k.stat.list[[paste0(k)]] <- k.stat
+  k.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+  k.ratio$k <- k
+  colnames(k.ratio) <- c("DistRatio", "k")
+  k.ratio.list[[paste0(k)]] <- k.ratio
+  
+  i.res <- testNhoods(i.milo, design.df=gastrulation.test.meta, design=~Condition, fdr.weighting="k-distance")
+  #i.res <- annotateNhoods(i.milo, coldata_col="group_id", da.res=i.res)
+  
+  i.res$k <- k
+  k.res.list[[paste0(k)]] <- i.res
+  
+  i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1]], 1, FUN=function(X) any(X> 0))])
+  
+  k.tp <- length(intersect(tp.cells, i.da))
+  k.fp <- length(intersect(tn.cells, i.da))
+  k.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+  k.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+  
+  k.confuse.list[[paste0(k)]] <- data.frame("TP"=k.tp, "FP"=k.fp, "TN"=k.tn, "FN"=k.fn, "k"=k)
+}
+
+k.res.df <- do.call(rbind.data.frame, k.res.list)
+k.res.df$Sig <- k.res.df$SpatialFDR < 0.1
+
+k.stat.df <- do.call(rbind.data.frame, k.stat.list)
+k.ratio.df <- do.call(rbind.data.frame, k.ratio.list)
+
+k.confuse.df <- do.call(rbind.data.frame, k.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of k
+k.confuse.df$TPR <- k.confuse.df$TP/(k.confuse.df$TP + k.confuse.df$FN)
+k.confuse.df$TNR <- k.confuse.df$TN/(k.confuse.df$FP + k.confuse.df$TN)
+k.confuse.df$FNR <- k.confuse.df$FN/(k.confuse.df$TP + k.confuse.df$FN)
+k.confuse.df$FDR <- k.confuse.df$FP/(k.confuse.df$TP + k.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+k.mean.df <- k.res.df[k.res.df$Sig, ] %>% group_by(group_id, k) %>%
+  summarise(mean(logFC))
+
+k.var.df <- k.res.df[k.res.df$Sig, ] %>% group_by(group_id, k) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying k using some of the measures defined by a confusion matrix, i.e. TPR, FPR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=8.95}
+k.confuse.melt <- melt(k.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'k'))
+colnames(k.confuse.melt) <- c("TP", "FP", "TN", "FN", "Kval", "Measure", "Value")
+k.confuse.melt$Kval <- ordered(k.confuse.melt$Kval,
+                               levels=k.vec)
+
+ggplot(k.confuse.melt, 
+       aes(x=Kval, y=Value, fill=Measure)) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_cowplot() + 
+  scale_fill_aaas() +
+  facet_wrap(~Measure, scales="free")  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="k", y="Measure") +
+  NULL
+```
+
+The power is pretty high from $k\geq15$, but the FDR is somewhat inflated. I'm not sure how much this is due to the complexities of the 
+gastrulationing trajectory, and how much is down to the cell-wise FDR giving the appearance of worse type I error control.
+
+How do the neighbourhood distances vary across different k values in the gastrulationing trajectory.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+k.stat.df$k <- ordered(k.stat.df$k, levels=k.vec)
+
+ggplot(k.stat.df,
+       aes(x=k, y=mean)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="K", y="Mean nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+So the mean nhood distance increases with `k`. As with the linear trajectory, there isn't really a clear point at which to select a value 
+from this.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+ggplot(k.stat.df,
+       aes(x=k, y=var)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="K", y="Variance nhood distance") +
+  expand_limits(y=c(0)) +
+  scale_y_log10() +
+  NULL
+```
+
+The nhood distance variances decrease with higher `k`, but the spread of variances also increases with very high values of `k`.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+k.ratio.df$k <- ordered(k.ratio.df$k, levels=k.vec)
+
+ggplot(k.ratio.df,
+       aes(x=k, y=DistRatio)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="K", y="Nhood distance ratio") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+This shows a similar pattern of increasing ratio with `k` as the mean nhood distance. This shows that the neighbourhoods are getting more 
+and more heterogeneous.
+
+### The impact of varying `d`
+
+Now we have seen the impact of varying `k`, I will vary `d` from 2 to 50 and fix `k=20`.
+
+```{r, message=FALSE, warning=FALSE}
+d.vec <- c(2, 3, 4, 5, 6, 7, 10, 12, 15, 18, 20, 25, 30, 35, 40, 45, 50)
+tp.cells <- unique(colnames(gastrulation.milo[,gastrulation.milo$group_id %in% c("M5", "M8")]))
+tn.cells <- colnames(gastrulation.milo[,!gastrulation.milo$group_id %in% c("M5", "M8")])
+
+k <- 20
+props <- 0.2
+
+gastrulation.test.meta <- data.frame("synth_samples"=unique(gastrulation.milo$synth_samples))
+gastrulation.test.meta$Condition <- gsub(gastrulation.test.meta$synth_samples, pattern="([A|B])_(R[0-9])", replacement="\\1")
+gastrulation.test.meta$Replicate <- gsub(gastrulation.test.meta$synth_samples, pattern="([A|B])_(R[0-9])", replacement="\\2")
+rownames(gastrulation.test.meta) <- gastrulation.test.meta$synth_samples
+
+d.res.list <- list()
+d.confuse.list <- list()
+d.stat.list <- list()
+d.ratio.list <- list()
+for(i in seq_along(d.vec)){
+  d <- d.vec[i]
+  i.milo <- buildGraph(gastrulation.milo, k=k, d=d, reduced.dim="PCA")
+  i.milo <- makeNhoods(i.milo, k=k, d=d, prop=props, refined=TRUE)
+  i.milo <- countCells(i.milo, samples="synth_samples", meta.data=as.data.frame(colData(i.milo)))
+  i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+  d.stat <- nhoodSummary(i.milo)
+  d.stat$d <- d
+  d.stat.list[[paste0(d)]] <- d.stat
+  d.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+  d.ratio$d <- d
+  colnames(d.ratio) <- c("DistRatio", "d")
+  d.ratio.list[[paste0(d)]] <- d.ratio
+  
+  i.res <- testNhoods(i.milo, design.df=gastrulation.test.meta, design=~Condition, fdr.weighting="k-distance")
+  i.res <- annotateNhoods(i.milo, coldata_col="group_id", da.res=i.res)
+  
+  i.res$d <- d
+  d.res.list[[paste0(d)]] <- i.res
+  
+  i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1]], 1, FUN=function(X) any(X> 0))])
+  
+  d.tp <- length(intersect(tp.cells, i.da))
+  d.fp <- length(intersect(tn.cells, i.da))
+  d.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+  d.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+  
+  d.confuse.list[[paste0(d)]] <- data.frame("TP"=d.tp, "FP"=d.fp, "TN"=d.tn, "FN"=d.fn, "d"=d)
+}
+
+d.res.df <- do.call(rbind.data.frame, d.res.list)
+d.res.df$Sig <- d.res.df$SpatialFDR < 0.1
+
+d.stat.df <- do.call(rbind.data.frame, d.stat.list)
+d.ratio.df <- do.call(rbind.data.frame, d.ratio.list)
+
+d.confuse.df <- do.call(rbind.data.frame, d.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of d
+d.confuse.df$TPR <- d.confuse.df$TP/(d.confuse.df$TP + d.confuse.df$FN)
+d.confuse.df$TNR <- d.confuse.df$TN/(d.confuse.df$FP + d.confuse.df$TN)
+d.confuse.df$FNR <- d.confuse.df$FN/(d.confuse.df$TP + d.confuse.df$FN)
+d.confuse.df$FDR <- d.confuse.df$FP/(d.confuse.df$TP + d.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+d.mean.df <- d.res.df[d.res.df$Sig, ] %>% group_by(group_id, d) %>%
+  summarise(mean(logFC))
+
+d.var.df <- d.res.df[d.res.df$Sig, ] %>% group_by(group_id, d) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying d using some of the measures defined by a confusion matrix, i.e. TPR, FDR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=8.95}
+d.confuse.melt <- melt(d.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'd'))
+colnames(d.confuse.melt) <- c("TP", "FP", "TN", "FN", "Dval", "Measure", "Value")
+d.confuse.melt$Dval <- ordered(d.confuse.melt$Dval,
+                               levels=d.vec)
+
+ggplot(d.confuse.melt, 
+       aes(x=Dval, y=Value, fill=Measure)) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_cowplot() + 
+  scale_fill_aaas() +
+  facet_wrap(~Measure, scales="free")  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="Measure") +
+  NULL
+```
+
+The impact of varying d has less of a linear effect, demonstrating that each dimension captures different axes of variation in the higher 
+dimensional space. The power is fairly consistent across the board, as is the FDR (albeit too high), indicating that `k` has a much 
+larger impact on power and FDR than the number of dimensions for this dataset.
+
+How do the neighbourhood distances vary across different d values?
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+d.stat.df$d <- ordered(d.stat.df$d, levels=d.vec)
+
+ggplot(d.stat.df,
+       aes(x=d, y=mean)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="#Dimensions", y="Mean nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+Given the fixed `k`, the mean nhood distance increases with higher `d`. That makes sense as the distance will linearly increase with a 
+linear increase in the number of dimensions.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+ggplot(d.stat.df,
+       aes(x=d, y=var)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="#Dimensions", y="Variance nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+This shows that the distance variance also increases slightly as a function of `d`, but not linearly. Across all values of `d` there are a 
+subset of highly variable nhoods.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+d.ratio.df$d <- ordered(d.ratio.df$d, levels=d.vec)
+
+ggplot(d.ratio.df,
+       aes(x=d, y=DistRatio)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="#Dimensions", y="Nhood distance ratio") +
+  expand_limits(y=c(0)) +
+  scale_y_log10() +
+  NULL
+```
+
+Now then, the ratio decreases as a function of `d`, which means the distances are converging. This is what we would expect from any distance 
+measure as the dimensionality increases.
+
+### The impact of co-varying `d` and `k`
+
+Now we have seen the impact of varying `k` and `d` separately I will vary `d` from 2 to 50 and vary `k` from 5 to 100.
+
+```{r, message=FALSE, warning=FALSE}
+d.vec <- c(2, 3, 4, 5, 6, 7, 10, 12, 15, 18, 20, 25, 30, 35, 40, 45, 50)
+tp.cells <- unique(colnames(gastrulation.milo[,gastrulation.milo$group_id %in% c("M5", "M8")]))
+tn.cells <- colnames(gastrulation.milo[,!gastrulation.milo$group_id %in% c("M5", "M8")])
+
+props <- 0.2
+
+gastrulation.test.meta <- data.frame("synth_samples"=unique(gastrulation.milo$synth_samples))
+gastrulation.test.meta$Condition <- gsub(gastrulation.test.meta$synth_samples, pattern="([A|B])_(R[0-9])", replacement="\\1")
+gastrulation.test.meta$Replicate <- gsub(gastrulation.test.meta$synth_samples, pattern="([A|B])_(R[0-9])", replacement="\\2")
+rownames(gastrulation.test.meta) <- gastrulation.test.meta$synth_samples
+
+kd.res.list <- list()
+kd.confuse.list <- list()
+kd.stat.list <- list()
+kd.ratio.list <- list()
+for(i in seq_along(d.vec)){
+  d <- d.vec[i]
+  for(j in seq_along(k.vec)){
+    k <- k.vec[j]
+    i.milo <- buildGraph(gastrulation.milo, k=k, d=d, reduced.dim="PCA")
+    i.milo <- makeNhoods(i.milo, k=k, d=d, prop=props, refined=TRUE)
+    i.milo <- countCells(i.milo, samples="synth_samples", meta.data=as.data.frame(colData(i.milo)))
+    i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+    kd.stat <- nhoodSummary(i.milo)
+    kd.stat$d <- d
+    kd.stat$k <- k
+    kd.stat.list[[paste0(k,d)]] <- kd.stat
+    kd.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+    kd.ratio$d <- d
+    kd.ratio$k <- k
+    colnames(kd.ratio) <- c("DistRatio", "d", "k")
+    kd.ratio.list[[paste0(k,d)]] <- kd.ratio
+  
+    i.res <- testNhoods(i.milo, design.df=gastrulation.test.meta, design=~Condition, fdr.weighting="k-distance")
+    i.res <- annotateNhoods(i.milo, coldata_col="group_id", da.res=i.res)
+    
+    i.res$d <- d
+    i.res$k <- k
+    kd.res.list[[paste0(k,d)]] <- i.res
+    
+    i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1], drop=FALSE], 1, FUN=function(X) any(X> 0))])
+    
+    d.tp <- length(intersect(tp.cells, i.da))
+    d.fp <- length(intersect(tn.cells, i.da))
+    d.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+    d.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+    
+    kd.confuse.list[[paste0(k,d)]] <- data.frame("TP"=d.tp, "FP"=d.fp, "TN"=d.tn, "FN"=d.fn, "d"=d, "k"=k)
+  }
+}
+
+kd.res.df <- do.call(rbind.data.frame, kd.res.list)
+kd.res.df$Sig <- kd.res.df$SpatialFDR < 0.1
+
+kd.stat.df <- do.call(rbind.data.frame, kd.stat.list)
+kd.ratio.df <- do.call(rbind.data.frame, kd.ratio.list)
+
+kd.confuse.df <- do.call(rbind.data.frame, kd.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of d
+kd.confuse.df$TPR <- kd.confuse.df$TP/(kd.confuse.df$TP + kd.confuse.df$FN)
+kd.confuse.df$TNR <- kd.confuse.df$TN/(kd.confuse.df$FP + kd.confuse.df$TN)
+kd.confuse.df$FNR <- kd.confuse.df$FN/(kd.confuse.df$TP + kd.confuse.df$FN)
+kd.confuse.df$FDR <- kd.confuse.df$FP/(kd.confuse.df$TP + kd.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+kd.mean.df <- kd.res.df[kd.res.df$Sig, ] %>% group_by(group_id, d, k) %>%
+  summarise(mean(logFC))
+
+kd.var.df <- kd.res.df[kd.res.df$Sig, ] %>% group_by(group_id, d, k) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying d using some of the measures defined by a confusion matrix, i.e. TPR, FPR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+kd.confuse.melt <- melt(kd.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'd', 'k'))
+colnames(kd.confuse.melt) <- c("TP", "FP", "TN", "FN", "Dval", "Kval", "Measure", "Value")
+kd.confuse.melt$Dval <- ordered(kd.confuse.melt$Dval,
+                                levels=d.vec)
+kd.confuse.melt$Kval <- ordered(kd.confuse.melt$Kval,
+                                levels=k.vec)
+
+
+ggplot(kd.confuse.melt[kd.confuse.melt$Measure %in% c("TPR"), ], 
+       aes(x=Dval, y=Kval, fill=Value)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis() +
+  facet_wrap(~Measure)  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+This grid shows the TPR as a function of the number input dimensions and `k`. Once $k\geq20$ the power is fairly high, though a very small 
+number of dimensions does impact on this, indicating that upwards of 10 domensions might be required for these complex multifurcating 
+trajectories.
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.confuse.melt[kd.confuse.melt$Measure %in% c("FDR"), ], 
+       aes(x=Dval, y=Kval, fill=Value)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=-1) +
+  facet_wrap(~Measure)  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+Perhaps frustratingly, cell-wiseFDR is only properly controlled at sub-optimal values of `k` and `d` w.r.t. power.
+
+How do the distance measures co-vary with `d` and `k`? I'll average over each pair of k and d values.
+
+```{r, warning=FALSE, message=FALSE}
+# calculate the mean and variance distances and ratios
+kd.stat.mean.df <- kd.stat.df %>% group_by(d, k) %>%
+  summarise(mean(mean))
+colnames(kd.stat.mean.df) <- c("d", "k", "Mean")
+kd.stat.mean.df$d <- ordered(kd.stat.mean.df$d, levels=d.vec)
+kd.stat.mean.df$k <- ordered(kd.stat.mean.df$k, levels=k.vec)
+
+kd.stat.var.df <- kd.stat.df %>% group_by(d, k) %>%
+  summarise(mean(var))
+colnames(kd.stat.var.df) <- c("d", "k", "Var")
+kd.stat.var.df$d <- ordered(kd.stat.var.df$d, levels=d.vec)
+kd.stat.var.df$k <- ordered(kd.stat.var.df$k, levels=k.vec)
+
+kd.ratio.mean.df <- kd.ratio.df %>% group_by(d, k) %>%
+  summarise(mean(DistRatio))
+colnames(kd.ratio.mean.df) <- c("d", "k", "DistRatio")
+kd.ratio.mean.df$d <- ordered(kd.ratio.mean.df$d, levels=d.vec)
+kd.ratio.mean.df$k <- ordered(kd.ratio.mean.df$k, levels=k.vec)
+```
+
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.stat.mean.df, 
+       aes(x=d, y=k, fill=Mean)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=1) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+This is the average of the mean nhood distances. Not an especially interesting relationship between `k` and `d` in this respect. It looks 
+almost identical to the discrete cluster simulation, but with more dependence on `d`.
+
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.stat.var.df, 
+       aes(x=d, y=k, fill=Var)) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=1) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+The average distance variance is generally pretty low. It's only for extreme value of `k` where it is dramatically different. This is similar 
+to the linear trajectory.
+
+```{r, message=FALSE, fig.height=3.95, fig.width=5.95}
+ggplot(kd.ratio.mean.df, 
+       aes(x=d, y=k, fill=log(DistRatio))) +
+  geom_tile() +
+  theme_cowplot() + 
+  scale_fill_viridis(direction=1) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="#Dimensions", y="K") +
+  NULL
+```
+
+I think any variation in the distance ratio is masked by the scale, so I've transformed it to a log-scale. Even then we can see that the 
+combination of a high value of `k` and low value of `d` have a disproportionate impact.
+
+### The impact of varying `prop`
+
+Finally, what effect does varying the initial sampling proportion have? I will fix k=20 and d=3 for this.
+
+```{r, message=FALSE, warning=FALSE}
+prop.vec <- c(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+tp.cells <- unique(colnames(gastrulation.milo[,gastrulation.milo$group_id %in% c("M5", "M8")]))
+tn.cells <- colnames(gastrulation.milo[,!gastrulation.milo$group_id %in% c("M5", "M8")])
+
+d <- 15
+k <- 20
+
+gastrulation.test.meta <- data.frame("synth_samples"=unique(gastrulation.milo$synth_samples))
+gastrulation.test.meta$Condition <- gsub(gastrulation.test.meta$synth_samples, pattern="([A|B])_(R[0-9])", replacement="\\1")
+gastrulation.test.meta$Replicate <- gsub(gastrulation.test.meta$synth_samples, pattern="([A|B])_(R[0-9])", replacement="\\2")
+rownames(gastrulation.test.meta) <- gastrulation.test.meta$synth_samples
+
+prop.res.list <- list()
+prop.confuse.list <- list()
+prop.stat.list <- list()
+prop.ratio.list <- list()
+for(i in seq_along(prop.vec)){
+  prop <- prop.vec[i]
+  i.milo <- buildGraph(gastrulation.milo, k=k, d=d, reduced.dim="PCA")
+  i.milo <- makeNhoods(i.milo, k=k, d=d, prop=prop, refined=TRUE)
+  i.milo <- countCells(i.milo, samples="synth_samples", meta.data=as.data.frame(colData(i.milo)))
+  i.milo <- calcNhoodDistance(i.milo, d=d, reduced.dim="PCA")
+  prop.stat <- nhoodSummary(i.milo)
+  prop.stat$prop <- prop
+  prop.stat.list[[paste0(prop)]] <- prop.stat
+  prop.ratio <- as.data.frame(nhoodRatio(i.milo, d=d))
+  prop.ratio$prop <- prop
+  colnames(prop.ratio) <- c("DistRatio", "prop")
+  prop.ratio.list[[paste0(prop)]] <- prop.ratio
+  
+  i.res <- testNhoods(i.milo, design.df=gastrulation.test.meta, design=~Condition, fdr.weighting="k-distance")
+  i.res <- annotateNhoods(i.milo, coldata_col="group_id", da.res=i.res)
+  
+  i.res$prop <- prop
+  prop.res.list[[paste0(prop)]] <- i.res
+  
+  i.da <- colnames(i.milo[, apply(nhoods(i.milo)[, i.res$Nhood[i.res$FDR < 0.1]], 1, FUN=function(X) any(X> 0))])
+  
+  prop.tp <- length(intersect(tp.cells, i.da))
+  prop.fp <- length(intersect(tn.cells, i.da))
+  prop.tn <- length(intersect(tn.cells, setdiff(colnames(i.milo), i.da)))
+  prop.fn <- length(intersect(setdiff(colnames(i.milo), i.da), tp.cells))
+  
+  prop.confuse.list[[paste0(prop)]] <- data.frame("TP"=prop.tp, "FP"=prop.fp, "TN"=prop.tn, "FN"=prop.fn, "Prop"=prop)
+}
+
+prop.res.df <- do.call(rbind.data.frame, prop.res.list)
+prop.res.df$Sig <- prop.res.df$SpatialFDR < 0.1
+
+prop.stat.df <- do.call(rbind.data.frame, prop.stat.list)
+prop.ratio.df <- do.call(rbind.data.frame, prop.ratio.list)
+
+prop.confuse.df <- do.call(rbind.data.frame, prop.confuse.list)
+```
+
+
+```{r, message=FALSE}
+# calculate the confusion matrix for each value of prop
+prop.confuse.df$TPR <- prop.confuse.df$TP/(prop.confuse.df$TP + prop.confuse.df$FN)
+prop.confuse.df$TNR <- prop.confuse.df$TN/(prop.confuse.df$FP + prop.confuse.df$TN)
+prop.confuse.df$FNR <- prop.confuse.df$FN/(prop.confuse.df$TP + prop.confuse.df$FN)
+prop.confuse.df$FDR <- prop.confuse.df$FP/(prop.confuse.df$TP + prop.confuse.df$FP)
+```
+
+
+```{r, message=FALSE}
+# calculate the mean and variance logFC
+prop.mean.df <- prop.res.df[prop.res.df$Sig, ] %>% group_by(group_id, prop) %>%
+  summarise(mean(logFC))
+
+prop.var.df <- prop.res.df[prop.res.df$Sig, ] %>% group_by(group_id, prop) %>%
+  summarise(var(logFC))
+```
+
+I'll evaluate the effect of varying prop using some of the measures defined by a confusion matrix, i.e. TPR, FPR, TNR, FNR
+
+```{r, message=FALSE, fig.height=3.95, fig.width=8.95}
+prop.confuse.melt <- melt(prop.confuse.df, id.vars=c('TP', 'FP', 'TN', 'FN', 'Prop'))
+colnames(prop.confuse.melt) <- c("TP", "FP", "TN", "FN", "Propval", "Measure", "Value")
+prop.confuse.melt$Kval <- ordered(prop.confuse.melt$Propval,
+                                  levels=prop.vec)
+
+ggplot(prop.confuse.melt, 
+       aes(x=Propval, y=Value, fill=Measure)) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_cowplot() + 
+  scale_fill_aaas() +
+  facet_wrap(~Measure, scales="free")  +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+        strip.background=element_rect(fill='white', colour='white')) +
+  labs(x="Sample proportion", y="Measure") +
+  NULL
+```
+
+It looks like a sampling proportion of 0.3-0.4 for this data set provides a balance between power and false discoveries with a small `k` and 
+`d`.
+
+What is the impact of the sampling proportion on nhood distances?
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+prop.stat.df$prop <- ordered(prop.stat.df$prop, levels=prop.vec)
+
+ggplot(prop.stat.df,
+       aes(x=prop, y=mean)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="Proportion", y="Mean nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+Perhaps unsurprisingly, the initial sampling proportion has very little impact on the mean nhood distance above a sensible value, e.g. 
+$\geq0.05$.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+ggplot(prop.stat.df,
+       aes(x=prop, y=var)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="Proportion", y="Variance nhood distance") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+There's a marginal impact on the distance variance, such that the nhoods become slightly more heterogeous above 0.05, after which they are 
+quite similar.
+
+```{r, warning=FALSE, message=FALSE, fig.height=2.95, fig.width=3.95}
+prop.ratio.df$prop <- ordered(prop.ratio.df$prop, levels=prop.vec)
+
+ggplot(prop.ratio.df,
+       aes(x=prop, y=DistRatio)) +
+  geom_boxplot() +
+  theme_cowplot() +
+  labs(x="Proportion", y="Nhood distance ratio") +
+  expand_limits(y=c(0)) +
+  NULL
+```
+
+The distance ratio also increases slightly and appears to stabilise ~0.2-0.3; this might indicate this ratio is a good way to select a 
+good nhood coverage.
