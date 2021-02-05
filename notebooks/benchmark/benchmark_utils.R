@@ -1,5 +1,6 @@
 ### BENCHMARKING FUNCTIONS ###
 
+suppressPackageStartupMessages({
 library(SingleCellExperiment)
 library(DAseq)
 library(miloR)
@@ -8,6 +9,7 @@ library(dplyr)
 library(igraph)
 library(cydar)
 library(pdist)
+  })
 
 ## Set-up reticulate 4 MELD
 reticulate::use_condaenv("emma_env", required=TRUE)
@@ -239,28 +241,72 @@ meld2output <- function(meld_res, likelihood_cutoff = 0.6, out_type="continuous"
   da.cell
 }
 
-# ## Cydar
-# 
-# cd <- prepareCellData(processed.exprs)
-# cd <- countCells(cd, tol=2, tol=2.0, filter=0, downsample=3)
-# # do DA testing with edgeR
-# cd.dge <- DGEList(assay(cd), lib.size=cd$totals)
-# 
-# # filter low abundance hyperspheres
-# keep <- aveLogCPM(sim.dge) >= aveLogCPM(1, mean(sim.cydar$totals))
-# sim.cydar <- sim.cydar[keep,]
-# sim.dge <- sim.dge[keep,]
-# 
-# sim.design <- model.matrix(~Condition, data=test.meta[gsub(colnames(sim.cydar), pattern="\\.", replacement="_"), ])
-# sim.dge <- estimateDisp(sim.dge, sim.design)
-# sim.fit <- glmQLFit(sim.dge, sim.design)
-# sim.res <- glmQLFTest(sim.fit, coef=2)
-# 
-# # control the spatial FDR
-# cydar.res <- sim.res$table
-# cydar.res$SpatialFDR <- spatialFDR(intensities(sim.cydar), sim.res$table$PValue)
-# is.sig <- cydar.res$SpatialFDR <= 0.1
-# summary(is.sig)
+## Cydar
+
+
+run_cydar <- function(sce, condition_col="synth_labels",
+                      sample_col="synth_samples",
+                      reduced.dim="pca.corrected",
+                      d=20,
+                      batch_col=NULL,
+                      alpha=0.1,
+                      tol=1.0,
+                      downsample=10,
+                      returnCd=TRUE){
+  ## Make design matrix
+  design_df <- as.tibble(colData(sce)[c(sample_col, condition_col, batch_col)]) %>%
+    distinct() %>%
+    column_to_rownames(sample_col)
+  if (is.null(batch_col)) {
+    design <- formula(paste('~', condition_col, collapse = ' '))  
+  } else {
+    design <- formula(paste('~', batch_col, "+", condition_col, collapse = ' '))
+  }
+  
+  ## Make list for each sample
+  sample_ls <- split(1:ncol(sce), sce[[sample_col]])
+  processed.exprs <- lapply(sample_ls, function(s) reducedDim(sce[,s], "pca.corrected")[,1:d])
+  cd <- prepareCellData(processed.exprs)
+  ## Count cells in hyperspheres
+  cd <- countCells(cd, tol=tol, filter=1, downsample=downsample)
+  # do DA testing with edgeR
+  cd.dge <- DGEList(assay(cd), lib.size=cd$totals)
+  
+  # # filter low abundance hyperspheres
+  # keep <- aveLogCPM(cd.dge ) >= aveLogCPM(1, mean(cd$totals))
+  # cd <- cd[keep,]
+  # cd.dge <- cd.dge[keep,]
+  
+  sim.design <- model.matrix(design, data=design_df)
+  sim.dge <- estimateDisp(cd.dge, sim.design)
+  sim.fit <- glmQLFit(sim.dge, sim.design)
+  sim.res <- glmQLFTest(sim.fit, coef=2)
+  
+  # control the spatial FDR
+  cydar.res <- sim.res$table
+  cydar.res$SpatialFDR <- spatialFDR(intensities(cd), sim.res$table$PValue)
+  is.sig <- cydar.res$SpatialFDR <= alpha
+  if (returnCd) {
+    list(Cd=cd, DAres=cydar.res)
+  } else {
+    cydar.res
+  }
+}
+
+cydar2output <- function(cd, da_res, out_type="continuous", alpha=0.1){
+  nhs <- lapply(cellAssignments(cd), function(hs) as.vector(hs))
+  hs_mat <- sapply(nhs, function(nh) ifelse(1:max(unlist(cellAssignments(cd))) %in% nh, 1, 0))
+  if (out_type=="continuous") { 
+    da.cell.mat <- hs_mat %*% da_res$logFC
+    da.cell <- da.cell.mat[,1]
+  } else {
+    da.hs <- ifelse(da_res$SpatialFDR < alpha, ifelse(da_res$logFC > 0, "PosLFC", 'NegLFC'), "NotDA")
+    da.hs.mat <- sapply(unique(da.hs), function(x) as.numeric(da.hs==x))
+    da.cell.mat <- hs_mat %*% da.hs.mat
+    da.cell <- apply(da.cell.mat, 1, function(x) colnames(da.cell.mat)[which.max(x)])
+  }
+  da.cell
+}
 
 ## Louvain clustering
 
@@ -282,12 +328,25 @@ run_louvain <- function(sce, condition_col, sample_col, k=15, d=30, reduced.dim=
   clust.df$Sample <- sample_labels
   clust.df$Condition <- condition_vec
   
-  louvain.model <- model.matrix(design, data=design_df)
   louvain.count <- as.matrix(table(clust.df$Louvain.Clust, clust.df$Sample))
-  louvain.dge <- DGEList(counts=louvain.count, lib.size=log(colSums(louvain.count)))
-  louvain.dge <- estimateDisp(louvain.dge, louvain.model)
-  louvain.fit <- glmQLFit(louvain.dge, louvain.model, robust=TRUE)
-  louvain.res <- as.data.frame(topTags(glmQLFTest(louvain.fit, coef=2), sort.by='none', n=Inf))
+  # louvain.model <- model.matrix(design, data=design_df)
+  # louvain.dge <- DGEList(counts=louvain.count, lib.size=log(colSums(louvain.count)))
+  # louvain.dge <- estimateDisp(louvain.dge, louvain.model)
+  # louvain.fit <- glmQLFit(louvain.dge, louvain.model, robust=TRUE)
+  # louvain.res <- as.data.frame(topTags(glmQLFTest(louvain.fit, coef=2), sort.by='none', n=Inf))
+  df <- data.frame(louvain.count) %>%
+    rename(cluster=Var1, sample=Var2) %>%
+    mutate(cluster=factor(cluster)) %>%
+    mutate(synth_labels=str_remove(sample, "_.+")) %>%
+    mutate(synth_labels) %>%
+    group_by(cluster) %>%
+    do(model=glm(Freq ~ synth_labels, data=.,  family="poisson")) 
+  
+  res_df <- t(sapply(df$model, function(x) summary(x)$coefficients[2,]))
+  colnames(res_df) <- c("logFC","Std. Error", "z value",    "Pval" )
+  louvain.res <- cbind(df, res_df) %>%
+    mutate(FDR=p.adjust(Pval, method = "BH"))
+  rownames(louvain.res) <- louvain.res$cluster
   
   clust.df$logFC <- louvain.res[clust.df$Louvain.Clust, 'logFC']
   clust.df$FDR <- louvain.res[clust.df$Louvain.Clust, 'FDR']
@@ -314,14 +373,14 @@ benchmark_da <- function(sce, condition_col='synth_labels',
                                        louvain = list(k=15)
                                        ),
                          d=30, out_type = "continuous"){
-  ## Run milo
-  milo_res <- run_milo(sce, condition_col=condition_col, sample_col=sample_col,
-                       reduced.dim = red_dim, d=d, k=params$milo$k)
-  milo_out <- milo2output(milo_res$Milo, milo_res$DAres, out_type = out_type)
-  ## Run milo controlling for batch
-  milo_batch_res <- run_milo(sce, condition_col=condition_col, sample_col=sample_col,
-                             reduced.dim = red_dim, d=d, k=params$milo$k, batch_col = "synth_batches")
-  milo_batch_out <- milo2output(milo_batch_res$Milo, milo_batch_res$DAres, out_type = out_type)
+#   ## Run milo
+#   milo_res <- run_milo(sce, condition_col=condition_col, sample_col=sample_col,
+#                        reduced.dim = red_dim, d=d, k=params$milo$k)
+#   milo_out <- milo2output(milo_res$Milo, milo_res$DAres, out_type = out_type)
+#   ## Run milo controlling for batch
+#   milo_batch_res <- run_milo(sce, condition_col=condition_col, sample_col=sample_col,
+#                              reduced.dim = red_dim, d=d, k=params$milo$k, batch_col = "synth_batches")
+#   milo_batch_out <- milo2output(milo_batch_res$Milo, milo_batch_res$DAres, out_type = out_type)
   ## Run DAseq
   daseq_res <- run_daseq(sce, k.vec=params$daseq$k.vec, condition_col, 
                          reduced.dim = red_dim, d=d)
@@ -342,12 +401,12 @@ benchmark_da <- function(sce, condition_col='synth_labels',
   if (!is.null(sce$true_DA_clust)) {
     bm$true_clust <- sce$true_DA_clust
   }
-  long_bm <- pivot_longer(bm, cols = c(milo, daseq, meld, louvain), names_to='method', values_to="pred") 
+  long_bm <- pivot_longer(bm, cols = c(milo, milo_batch, daseq, meld, louvain), names_to='method', values_to="pred") 
   return(long_bm)
 }
 
 calculate_outcome <- function(long_bm){
-  long_bm %>%
+  long_bm <- long_bm %>%
     mutate(outcome=case_when(true==pred & pred!="NotDA" ~ 'TP',
                              true!=pred & pred!="NotDA" ~ 'FP',
                              true!=pred & pred=="NotDA" ~ 'FN',
@@ -355,8 +414,19 @@ calculate_outcome <- function(long_bm){
     )) %>%
     group_by(method, outcome) %>%
     summarise(n=n()) %>%
-    pivot_wider(id_cols=method, names_from=outcome, values_from=n, values_fill=0) %>%
-    mutate(TPR=TP/(TP+FP), FPR=FP/(TP+FP), TNR=TN/(TN+FN), FNR = FN/(FN+TP),
+    pivot_wider(id_cols=method, names_from=outcome, values_from=n, values_fill=0) 
+  
+  check_cols <- c("TP","FP","FN","TN") %in% colnames(long_bm)
+  if (any(!check_cols)) {
+    add_cols <- c("TP","FP","FN","TN")[!check_cols]
+    for (col in add_cols) {
+      long_bm[[col]] <- rep(0, nrow(long_bm))
+      }
+  }
+  
+  long_bm %>%
+    mutate(TPR=TP/(TP+FN), FPR=FP/(FP+TN), TNR=TN/(TN+FP), FNR = FN/(FN+TP),
+           Precision = TP/(TP+FP),
            Power = 1 - FNR,
            Accuracy = (TP + TN)/(TP + TN + FP + FN)
     )
