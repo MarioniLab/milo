@@ -9,11 +9,12 @@ library(dplyr)
 library(igraph)
 library(cydar)
 library(pdist)
+  library(reshape2)
   })
 
-# ## Set-up reticulate 4 MELD
-reticulate::use_condaenv("emma_env", required=TRUE)
-library(reticulate) ## development version of reticulate, or numba use breaks C stack
+# # ## Set-up reticulate 4 MELD
+# reticulate::use_condaenv("emma_env", required=TRUE)
+# library(reticulate) ## development version of reticulate, or numba use breaks C stack
 
 ### SYNTHETIC LABELS ###
 
@@ -301,12 +302,7 @@ run_cydar <- function(sce, condition_col="synth_labels",
   # do DA testing with edgeR
   cd.dge <- DGEList(assay(cd), lib.size=cd$totals)
   
-  # # filter low abundance hyperspheres
-  # keep <- aveLogCPM(cd.dge ) >= aveLogCPM(1, mean(cd$totals))
-  # cd <- cd[keep,]
-  # cd.dge <- cd.dge[keep,]
-  
-  sim.design <- model.matrix(design, data=design_df)
+  sim.design <- model.matrix(design, data=design_df)[colnames(cd.dge),]
   sim.dge <- estimateDisp(cd.dge, sim.design)
   sim.fit <- glmQLFit(sim.dge, sim.design)
   sim.res <- glmQLFTest(sim.fit, coef=2)
@@ -324,7 +320,7 @@ run_cydar <- function(sce, condition_col="synth_labels",
 
 cydar2output <- function(cd, da_res, out_type="continuous", alpha=0.1){
   nhs <- lapply(cellAssignments(cd), function(hs) as.vector(hs))
-  hs_mat <- sapply(nhs, function(nh) ifelse(1:max(unlist(cellAssignments(cd))) %in% nh, 1, 0))
+  hs_mat <- sapply(nhs, function(nh) ifelse(1:sum(cd@colData$totals) %in% nh, 1, 0))
   if (out_type=="continuous") { 
     da.cell.mat <- hs_mat %*% da_res$logFC
     da.cell <- da.cell.mat[,1]
@@ -339,12 +335,16 @@ cydar2output <- function(cd, da_res, out_type="continuous", alpha=0.1){
 
 ## Louvain clustering
 
-run_louvain <- function(sce, condition_col, sample_col, k=15, d=30, reduced.dim="PCA"){
+run_louvain <- function(sce, condition_col, sample_col, k=15, d=30, reduced.dim="PCA", batch_col=NULL){
   ## Make design matrix
-  design_df <- as.tibble(colData(sce)[c(sample_col, condition_col)]) %>%
+  design_df <- as.tibble(colData(sce)[c(sample_col, condition_col, batch_col)]) %>%
     distinct() %>%
-    column_to_rownames(sample_col)
-  design <- formula(paste('~', condition_col, collapse = ' '))
+    rename(sample=sample_col)
+  if (is.null(batch_col)) {
+    design <- formula(paste('Freq ~', condition_col, "+ offset(log(N_s))", collapse = ' '))  
+  } else {
+    design <- formula(paste('Freq ~', batch_col, "+", condition_col, "+ offset(log(N_s))", collapse = ' '))
+  }
   ## Louvain clustering
   X_red_dim = reducedDim(sce, reduced.dim)[,1:d]
   sce.graph <- buildKNNGraph(t(X_red_dim), k=k)
@@ -357,21 +357,19 @@ run_louvain <- function(sce, condition_col, sample_col, k=15, d=30, reduced.dim=
   clust.df$Sample <- sample_labels
   clust.df$Condition <- condition_vec
   
-  louvain.count <- as.matrix(table(clust.df$Louvain.Clust, clust.df$Sample))
-  # louvain.model <- model.matrix(design, data=design_df)
-  # louvain.dge <- DGEList(counts=louvain.count, lib.size=log(colSums(louvain.count)))
-  # louvain.dge <- estimateDisp(louvain.dge, louvain.model)
-  # louvain.fit <- glmQLFit(louvain.dge, louvain.model, robust=TRUE)
-  # louvain.res <- as.data.frame(topTags(glmQLFTest(louvain.fit, coef=2), sort.by='none', n=Inf))
-  df <- data.frame(louvain.count) %>%
-    rename(cluster=Var1, sample=Var2) %>%
-    mutate(cluster=factor(cluster)) %>%
-    mutate(synth_labels=str_remove(sample, "_.+")) %>%
-    mutate(synth_labels) %>%
-    group_by(cluster) %>%
-    do(model=glm(Freq ~ synth_labels, data=.,  family="poisson")) 
+  louvain.count <- table(clust.df$Louvain.Clust, clust.df$Sample)
+  attributes(louvain.count)$class <- "matrix"
   
-  res_df <- t(sapply(df$model, function(x) summary(x)$coefficients[2,]))
+  df <- melt(louvain.count, varnames=c("cluster", "sample"),  value.name="Freq") %>%
+    mutate(cluster=factor(cluster)) %>%
+    left_join(design_df, by="sample") %>%
+    group_by(sample) %>%
+    mutate(N_s=sum(Freq)) %>%
+    ungroup() %>%
+    group_by(cluster) %>%
+    do(model=glm(design, data=., family="poisson")) 
+  
+  res_df <- t(sapply(df$model, function(x) summary(x)$coefficients[nrow(summary(x)$coefficients),]))
   colnames(res_df) <- c("logFC","Std. Error", "z value",    "Pval" )
   louvain.res <- cbind(df, res_df) %>%
     mutate(FDR=p.adjust(Pval, method = "BH"))
@@ -382,16 +380,124 @@ run_louvain <- function(sce, condition_col, sample_col, k=15, d=30, reduced.dim=
   return(clust.df)
   }
 
-louvain2output <- function(louvain_res, out_type="continuous", alpha=0.1){
+louvain2output <- function(louvain_res, out_type="continuous", alpha=0.1, lfc_threshold=0){
   if (out_type=="continuous") {
     da.cell <- louvain_res$logFC
   } else {
-    da.cell <- ifelse(louvain_res$FDR < alpha, ifelse(louvain_res$logFC > 0, "PosLFC", 'NegLFC'), "NotDA")
+    da.cell <- ifelse(louvain_res$FDR < alpha & abs(louvain_res$logFC) > lfc_threshold, ifelse(louvain_res$logFC > 0, "PosLFC", 'NegLFC'), "NotDA")
   }
   da.cell
 }
 
 ### RUN BENCHMARK ON SYNTHETIC LABELS ###
+
+runDA <- function(sce, coldata, X_pca, 
+                  method, 
+                  condition_col='synth_labels', 
+                  sample_col="synth_samples",
+                  params = list(milo = list(k=15),
+                                meld = list(k=15),
+                                daseq = list(k.vec=c(10,20,30, 40)),
+                                louvain = list(k=15),
+                                cydar = list(tol=5, downsample=3)
+                  ), d=30, out_type="label"
+                  ){
+  ## Check that method name is in params
+  if (!method %in% names(params)) {
+    stop(paste("Specify parameters for method", method))
+  }
+  ## Check valid method
+  if (!method %in% c("milo", "milo_batch", "louvain", 'daseq', "louvain_batch", 'cydar')) {
+    stop("Unrecognized method")
+  }
+  
+  ## Add reduced dim + coldata to sce
+  colData(sce) <- DataFrame(coldata)
+  reducedDim(sce, "pca_batch") <- as.matrix(X_pca)
+  
+  ## Run method
+  ## Run milo
+  if (method=="milo") {
+    milo_res <- run_milo(sce, condition_col=condition_col, sample_col=sample_col,
+                         reduced.dim = "pca_batch", d=d, k=params$milo$k)
+    out <- milo2output(milo_res$Milo, milo_res$DAres, out_type = out_type)
+  } else if (method == "milo_batch"){
+    ## Run milo controlling for batch
+    milo_batch_res <- run_milo(sce, condition_col=condition_col, sample_col=sample_col,
+                               reduced.dim = "pca_batch", d=d, k=params$milo$k, batch_col = "synth_batches")
+    out <- milo2output(milo_batch_res$Milo, milo_batch_res$DAres, out_type = out_type)
+  } else if (method == "cydar"){
+    cydar_res <- run_cydar(sce, condition_col=condition_col, sample_col=sample_col,
+                               reduced.dim = "pca_batch", d=d, tol=params$cydar$tol,
+                           downsample=params$cydar$downsample)
+    out <- cydar2output(cydar_res$Cd, cydar_res$DAres, out_type = out_type)
+  } else if (method == "cydar_batch"){
+    cydar_batch_res <- run_cydar(sce, condition_col=condition_col, sample_col=sample_col,
+                           reduced.dim = "pca_batch", d=d, tol=params$cydar$tol,
+                           downsample=params$cydar$downsample, batch_col = "synth_batches")
+    out <- cydar2output(cydar_batch_res$Cd, cydar_batch_res$DAres, out_type = out_type)
+  } else if (method == "daseq"){
+    ## Run DAseq
+    daseq_res <- run_daseq(sce, k.vec=params$daseq$k.vec, condition_col, 
+                           reduced.dim = "pca_batch", d=d)
+    out <- daseq2output(sce, daseq_res, out_type = out_type)
+  } else if (method == "louvain"){
+    ## Run louvain
+    louvain_res <- run_louvain(sce, condition_col=condition_col, sample_col=sample_col,
+                               reduced.dim = "pca_batch", d=d, k=params$louvain$k)
+    out <- louvain2output(louvain_res, out_type = out_type)
+  } else if (method == "louvain_batch"){
+    ## Run louvain
+    louvain_batch_res <- run_louvain(sce, condition_col=condition_col, sample_col=sample_col,
+                               reduced.dim = "pca_batch", d=d, k=params$louvain$k, batch_col="synth_batches")
+    out <- louvain2output(louvain_batch_res, out_type = out_type)
+  }
+  
+  ## Save results
+  bm <- data.frame(bm_out=out)
+  if (length(out) < ncol(sce)) {
+    return(out)
+  }
+  bm$true_prob <- sce$Condition2_prob 
+  bm$true <- sce$true_labels
+  if (!is.null(sce$true_DA_clust)) {
+    bm$true_clust <- sce$true_DA_clust
+  }
+  long_bm <- pivot_longer(bm, cols = bm_out, names_to='method', values_to="pred")
+  long_bm[["method"]] <- method
+  return(long_bm)
+}
+
+
+calculate_outcome <- function(long_bm){
+  long_bm <- long_bm %>%
+    mutate(outcome=case_when(true==pred & pred!="NotDA" ~ 'TP',
+                             true!=pred & pred!="NotDA" ~ 'FP',
+                             true!=pred & pred=="NotDA" ~ 'FN',
+                             true==pred & pred=="NotDA"  ~ "TN"
+    )) %>%
+    group_by(method, outcome) %>%
+    summarise(n=n()) %>%
+    pivot_wider(id_cols=method, names_from=outcome, values_from=n, values_fill=0) 
+  
+  check_cols <- c("TP","FP","FN","TN") %in% colnames(long_bm)
+  if (any(!check_cols)) {
+    add_cols <- c("TP","FP","FN","TN")[!check_cols]
+    for (col in add_cols) {
+      long_bm[[col]] <- rep(0, nrow(long_bm))
+      }
+  }
+  
+  long_bm %>%
+    mutate(TPR=TP/(TP+FN), FPR=FP/(FP+TN), TNR=TN/(TN+FP), FNR = FN/(FN+TP),
+           FDR = FP/(TP+FP),
+           Precision = TP/(TP+FP),
+           Power = 1 - FNR,
+           Accuracy = (TP + TN)/(TP + TN + FP + FN)
+    )
+}
+
+## --- old functions --- ##
 
 benchmark_da <- function(sce, condition_col='synth_labels', 
                          sample_col="synth_samples",
@@ -399,17 +505,19 @@ benchmark_da <- function(sce, condition_col='synth_labels',
                          params = list(milo = list(k=15),
                                        meld = list(k=15),
                                        daseq = list(k.vec=c(10,20,30, 40)),
-                                       louvain = list(k=15)
-                                       ),
+                                       louvain = list(k=15),
+                                       cydar = list(tol=5, downsample=3)
+                         ),
                          d=30, out_type = "continuous"){
-#   ## Run milo
-#   milo_res <- run_milo(sce, condition_col=condition_col, sample_col=sample_col,
-#                        reduced.dim = red_dim, d=d, k=params$milo$k)
-#   milo_out <- milo2output(milo_res$Milo, milo_res$DAres, out_type = out_type)
-#   ## Run milo controlling for batch
-#   milo_batch_res <- run_milo(sce, condition_col=condition_col, sample_col=sample_col,
-#                              reduced.dim = red_dim, d=d, k=params$milo$k, batch_col = "synth_batches")
-#   milo_batch_out <- milo2output(milo_batch_res$Milo, milo_batch_res$DAres, out_type = out_type)
+  ## Run milo
+  milo_res <- run_milo(sce, condition_col=condition_col, sample_col=sample_col,
+                       reduced.dim = red_dim, d=d, k=params$milo$k)
+  milo_out <- milo2output(milo_res$Milo, milo_res$DAres, out_type = out_type)
+  ## Run milo controlling for batch
+  milo_batch_res <- run_milo(sce, condition_col=condition_col, sample_col=sample_col,
+                             reduced.dim = red_dim, d=d, k=params$milo$k, batch_col = "synth_batches")
+  milo_batch_out <- milo2output(milo_batch_res$Milo, milo_batch_res$DAres, out_type = out_type)
+  
   ## Run DAseq
   daseq_res <- run_daseq(sce, k.vec=params$daseq$k.vec, condition_col, 
                          reduced.dim = red_dim, d=d)
@@ -433,35 +541,6 @@ benchmark_da <- function(sce, condition_col='synth_labels',
   long_bm <- pivot_longer(bm, cols = c(milo, milo_batch, daseq, meld, louvain), names_to='method', values_to="pred") 
   return(long_bm)
 }
-
-calculate_outcome <- function(long_bm){
-  long_bm <- long_bm %>%
-    mutate(outcome=case_when(true==pred & pred!="NotDA" ~ 'TP',
-                             true!=pred & pred!="NotDA" ~ 'FP',
-                             true!=pred & pred=="NotDA" ~ 'FN',
-                             true==pred & pred=="NotDA"  ~ "TN"
-    )) %>%
-    group_by(method, outcome) %>%
-    summarise(n=n()) %>%
-    pivot_wider(id_cols=method, names_from=outcome, values_from=n, values_fill=0) 
-  
-  check_cols <- c("TP","FP","FN","TN") %in% colnames(long_bm)
-  if (any(!check_cols)) {
-    add_cols <- c("TP","FP","FN","TN")[!check_cols]
-    for (col in add_cols) {
-      long_bm[[col]] <- rep(0, nrow(long_bm))
-      }
-  }
-  
-  long_bm %>%
-    mutate(TPR=TP/(TP+FN), FPR=FP/(FP+TN), TNR=TN/(TN+FP), FNR = FN/(FN+TP),
-           Precision = TP/(TP+FP),
-           Power = 1 - FNR,
-           Accuracy = (TP + TN)/(TP + TN + FP + FN)
-    )
-}
-
-## --- old functions --- ##
 
 
 # Given a data_embedding, sample a simplex to weight each dimension to get a
