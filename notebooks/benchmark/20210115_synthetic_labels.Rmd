@@ -98,527 +98,81 @@ for (i in 1:3) {
 }
 ```
 
+### Load benchmarking results
 
-
-## Simulate ONE DA region
-
-```{r, fig.height=7, fig.width=7}
-.plot_prob <- function(pop, pop_enr){
-  embryo_sce <- add_synthetic_labels_pop(embryo_sce, pop = pop, pop_col="celltype", pop_enr = pop_enr) 
-  plotUMAP(embryo_sce, colour_by="Condition1_prob", point_size=0.1) + scale_color_viridis_c(limits=c(0.5,1))
-}
-
-pl_ls_1 <- lapply(c(0.7, 0.85, 1), function(x) .plot_prob("Paraxial mesoderm", x))
-pl_ls_2 <- lapply(c(0.7, 0.85, 1), function(x) .plot_prob("Epiblast", x))
-pl_ls_3 <- lapply(c(0.7, 0.85, 1), function(x) .plot_prob("Erythroid1", x))
-
-wrap_plots(c(pl_ls_1, pl_ls_2, pl_ls_3)) +
-  plot_layout(ncol=3, nrow=3, guides='collect') +
-```
-
-## Try one method at the time (to pick params)
-
-<!-- ```{r} -->
-<!-- embryo_sce <- readRDS("/nfs/team205/ed6/data/milo_benchmark/embryo_data_bm.RDS") -->
-
-<!-- # Build KNN graph for smoothing -->
-<!-- X_red_dim = reducedDim(embryo_sce, "pca.corrected")[,1:30] -->
-<!-- graph = buildKNNGraph(t(X_red_dim), k = 15)   -->
-
-<!-- ## Simulate labels -->
-<!-- seed=2022 -->
-<!-- embryo_sce <- add_synthetic_labels(embryo_sce,  -->
-<!--                                    n_components = 10,   -->
-<!--                                    redDim='pca.corrected',  -->
-<!--                                    seed=seed,  -->
-<!--                                    knn_graph = graph,  -->
-<!--                                    n_replicates = 6) -->
-<!-- true_labels <- ifelse(embryo_sce$Condition2_prob < 0.4, "NegLFC", ifelse(embryo_sce$Condition2_prob > 0.6, "PosLFC", "NotDA")) -->
-<!-- colData(embryo_sce)[["true_labels"]] <- true_labels -->
-
-<!-- embryo_sce <- runUMAP(embryo_sce, dimred="pca.corrected", name = 'UMAP', n_dimred=1:30) -->
-<!-- ``` -->
-
-
-<!-- Divide cells into true affected subpopulations: take KNN adjacency matrix, filter out edges between cells with different label, then do louvain_clustering at high res -->
-
-<!-- ```{r} -->
-
-<!-- embryo_sce <- cluster_synthetic_labels(embryo_sce, graph) -->
-<!-- plotReducedDim(embryo_sce, dimred="UMAP", colour_by="true_labels", point_size=0.2)  -->
-<!-- plotReducedDim(embryo_sce, dimred="UMAP", colour_by="true_DA_clust",  -->
-<!--                text_by="true_DA_clust",  -->
-<!--                point_size=0.2)  -->
-<!-- ``` -->
-
-### Cydar
+Methods are run with `run_DA_R.r` and `run_meld.py`, wrapped in `submit_benchmark.sh`. The outcome is calculated in `build_outcome.R`. 
 
 ```{r}
-library(cydar)
-
-## Cydar
-cydar_res <- run_cydar(embryo_sce, tol=3, d=30)
-
-plot(cydar_res$DAres$logFC, -log10(cydar_res$DAres$SpatialFDR), xlab='logFC', ylab="-log10(SpatialFDR)")
-abline(v=aveLogCPM(1,mean(cydar_res$Cd$totals)))
-
-cydar_out <- cydar2output(cydar_res$Cd, cydar_res$DAres, out_type = "continuous")
-
-hist(cydar_res$DAres$PValue)
-```
-
-### Louvain
-
-```{r}
-library(broom)
-
-## Louvain clustering
-d=30
-condition_col = 'synth_labels'
-sample_col = 'synth_samples'
-
-X_red_dim = reducedDim(embryo_sce, "pca.corrected")[,1:d]
-sce.graph <- buildKNNGraph(t(X_red_dim), k=50)
-louvain.clust <- cluster_louvain(sce.graph)
-louvain.clust.ids <- membership(louvain.clust)
-
-condition_vec <- colData(embryo_sce)[[condition_col]]
-sample_labels <- colData(embryo_sce)[[sample_col]]
-clust.df <- data.frame("cell_id"=colnames(embryo_sce), "Louvain.Clust"=as.character(louvain.clust.ids))
-clust.df$Sample <- sample_labels
-clust.df$Condition <- condition_vec
-
-plotUMAP(embryo_sce, colour_by="louvain_clust", text_by="louvain_clust", point_size=0.1)
-
-## Make design matrix
-batch_col = NULL
-design_df <- as.tibble(colData(embryo_sce)[c(sample_col, condition_col, batch_col)]) %>%
-    distinct() %>%
-    column_to_rownames(sample_col)
- if (is.null(batch_col)) {
-    design <- formula(paste('~', condition_col, collapse = ' '))  
-  } else {
-    design <- formula(paste('~', batch_col, "+", condition_col, collapse = ' '))
-  }
-
-louvain.model <- model.matrix(~ synth_labels, data=design_df)
-louvain.count <- as.matrix(table(clust.df$Louvain.Clust, clust.df$Sample))
-
-df <- data.frame(louvain.count) %>%
-  rename(cluster=Var1, sample=Var2) %>%
-  mutate(cluster=factor(cluster)) %>%
-  mutate(synth_labels=str_remove(sample, "_.+")) %>%
-  mutate(synth_labels) %>%
-  group_by(cluster) %>%
-  do(model=glm(Freq ~ synth_labels, data=.,  family="poisson")) 
-
-res_df <- sapply(df$model, function(x) summary(x)$coefficients[2,]) %>%
-  t()
-colnames(res_df) <- c("logFC","Std. Error", "z value",    "Pval" )
-louvain.res <- cbind(df, res_df) %>%
-  mutate(FDR=p.adjust(Pval, method = "BH"))
-rownames(louvain.res) <- louvain.res$cluster
-
-clust.df$logFC <- louvain.res[clust.df$Louvain.Clust, 'logFC']
-clust.df$FDR <- louvain.res[clust.df$Louvain.Clust, 'FDR']
-
-embryo_sce$louvain_logFC <- clust.df$logFC
-embryo_sce$louvain_clust <- clust.df$Louvain.Clust
-embryo_sce$louvain_FDR <- -log10(clust.df$FDR)
-
-plot(embryo_sce$louvain_logFC, -log10(embryo_sce$lo))
-plotUMAP(embryo_sce, colour_by="Condition1_prob", point_size=0.1)
-plotUMAP(embryo_sce, colour_by="louvain_logFC", text_by="louvain_clust", point_size=0.1)
-
-```
-```{r}
-louv_res <- run_louvain(embryo_sce, condition_col = "synth_labels", sample_col="synth_samples", k=50, reduced.dim = "pca_batch")
-
-embryo_sce$louvain_logFC <- louv_res$logFC
-embryo_sce$louvain_clust <- louv_res$Louvain.Clust
-embryo_sce$louvain_FDR <- -log10(louv_res$FDR)
-
-plot(embryo_sce$louvain_logFC, embryo_sce$louvain_FDR)
-plotUMAP(embryo_sce, colour_by="Condition1_prob", point_size=0.1)
-plotUMAP(embryo_sce, colour_by="louvain_logFC", point_size=0.1)
-plotUMAP(embryo_sce, colour_by="louvain_FDR", text_by="louvain_clust", point_size=0.1)
-```
-
-
-```{r}
-# louvain.dge <- DGEList(counts=louvain.count, lib.size=log(colSums(louvain.count)))
-# louvain.dge <- estimateDisp(louvain.dge, louvain.model)
-# louvain.fit <- glmQLFit(louvain.dge, louvain.model, robust=TRUE)
-# louvain.res <- as.data.frame(topTags(glmQLFTest(louvain.fit, coef=ncol(louvain.model)), sort.by='none', n=Inf))
-# 
-# plotQLDisp(louvain.fit, cex = 3)
-clust.df$logFC <- louvain.res[clust.df$Louvain.Clust, 'logFC']
-clust.df$FDR <- louvain.res[clust.df$Louvain.Clust, 'FDR']
-
-embryo_sce$louvain_logFC <- clust.df$logFC
-embryo_sce$louvain_clust <- clust.df$Louvain.Clust
-embryo_sce$louvain_FDR <- clust.df$FDR
-
-louvain.res
-
-plot(embryo_sce$louvain_logFC, -log10(embryo_sce$lo))
-plotUMAP(embryo_sce, colour_by="Condition1_prob", text_by="louvain_clust", point_size=0.1)
-plotUMAP(embryo_sce, colour_by="louvain_logFC", text_by="louvain_clust", point_size=0.1)
-```
-
-
-
-<!-- ```{r} -->
-<!-- df_glm <- -->
-<!--   reshape2::melt(louvain.count, varnames=c("cluster", "sample")) %>% -->
-<!--   mutate(cluster=factor(cluster)) %>% -->
-<!--   left_join(design_df %>% rownames_to_column("sample")) %>% -->
-<!--   group_by(sample) %>% -->
-<!--   mutate(n=sum(value)) %>% -->
-<!--   ungroup() %>% -->
-<!--   mutate(other=n-value) -->
-
-<!-- formula = cbind(value, other) ~ cluster*synth_labels -->
-<!-- # ggplot(df_glm[df_glm$cluster=='18',], aes(x=synth_labels, y=value)) + geom_point() -->
-<!-- model1 <- glm(formula = formula, family = binomial(link="logit"), data = df_glm) -->
-<!-- summary(model1) -->
-<!-- ``` -->
-
-### Milo
-
-Pick K using within/between cluster distance
-```{r}
-nhoodRatio <- function(x, d=50,  reduced.dim="PCA", ...){
-  require(BiocNeighbors)
-  # calcuate the ratio of within-nhood distances (distance from index to kth cell)
-  # to the between nhood-distance (distance to nearest other index cell)
-  if(length(nhoodIndex(x)) > 0){
-    # get the maximum distance in each nhood
-    within.dist <- sapply(unlist(nhoodIndex(x)), FUN=function(X) max(nhoodDistances(x)[[paste0(X)]]))
-    # find the 1NN between nhoodIndex cells
-    between.dist <- findKNN(reducedDim(x[, unlist(nhoodIndex(x))], reduced.dim)[, c(1:d)],
-                            k=1)$distance
-    dist.ratio <- within.dist/between.dist
-    return(dist.ratio)
-  } else{
-    stop("Compute nhoods first")
-  }
-  
-}
-
-calc_nhood_ratio <- function(milo, k=50,d=30, prop=0.1, reduced.dim="pca.corrected"){
-  milo <- buildGraph(milo, k=k, d=d, reduced.dim = reduced.dim)
-  milo <- makeNhoods(milo, prop = prop, k=k, d=d, reduced_dims = reduced.dim)
-  d.ratio <- nhoodRatio(milo, d=30)
-  d.ratio
-  }
-
-milo <- Milo(embryo_sce)
-milo <- buildGraph(milo, k=50, d=30, reduced.dim = "pca.corrected")
-milo <- makeNhoods(milo, prop = 0.1, k=50, d=30, reduced_dims = "pca.corrected")
-milo <- calcNhoodDistance(milo, d=30, reduced.dim = "pca.corrected")
-
-X_pca <- reducedDim(milo, "pca.corrected")[,1:d]
-
-X_pca_ixs <- X_pca[unlist(nhoodIndex(milo)),]
-X_pca_cells <- X_pca[rowSums(nhoods(milo))>0,]
-
-nhoods_mat <- nhoods(milo)
-as.matrix(nhoods_mat[1:3000, 1:100]) %*% X_pca_ixs[1:100,]
-
-
-
-X_pca[nhoods(milo)[1,]==1,]
-
-d.ratios <- sapply(seq(10,50, by=5), function(k) calc_nhood_ratio(milo, k=k))
-```
-
-```{r, fig.height=8, fig.width=8}
-milo_out <- run_milo(embryo_sce, condition_col="synth_labels", sample_col="synth_samples", reduced.dim="pca.corrected",
-         k=50, prop=0.1)
-
-milo_out$Milo <- buildNhoodGraph(milo_out$Milo)
-embryo_sce$milo_res <- milo2output(milo_out$Milo, milo_out$DAres, out_type = "labels")
-true_labels <- ifelse(embryo_sce$Condition2_prob < 0.4, "NegLFC", ifelse(embryo_sce$Condition2_prob > 0.6, "PosLFC", "NotDA"))
-colData(embryo_sce)[["true_labels"]] <- true_labels
-
-plotReducedDim(embryo_sce, dimred="UMAP", colour_by="milo_res", point_size=0.2) 
-plotReducedDim(embryo_sce, dimred="UMAP", colour_by="Condition2_prob", point_size=0.2) 
-plotReducedDim(embryo_sce, dimred="UMAP", colour_by="true_labels", point_size=0.2) 
-```
-
-Compare with MELD
-
-```{r, fig.height=8, fig.width=8}
-meld_out <- run_meld_reticulate(embryo_sce, condition_col="synth_labels", sample_col="synth_samples", reduced.dim="pca.corrected",
-         k=50)
-
-embryo_sce$meld_res <- meld2output(meld_out, out_type = "labels")
-
-plotReducedDim(embryo_sce, dimred="UMAP", colour_by="meld_res", point_size=0.2) 
-plotReducedDim(embryo_sce, dimred="UMAP", colour_by="true_labels", point_size=0.2) 
-```
-
-<!-- Does the prop/k need to reach saturation? -->
-
-<!-- ```{r} -->
-<!-- milo_ls <- lapply(seq(20,50, by = 10), function(k){ -->
-<!--   m <- buildGraph(Milo(embryo_sce), k=k, d=30, reduced.dim = 'pca.corrected')  -->
-<!--   m <-  makeNhoods(m, prop = 0.1, k=k, d=30, reduced_dims = 'pca.corrected')  -->
-<!--   m -->
-<!--   }) -->
-
-<!-- names(milo_ls) <- seq(20,50, by = 10) -->
-<!-- imap(milo_ls, ~ data.frame( n_nhoods = rowSums(.x@nhoods), k=.y) ) %>% -->
-<!--   purrr::reduce(bind_rows) %>% -->
-<!--   ggplot(aes(fill=k, n_nhoods)) + geom_histogram(bins=50, position="identity") -->
-
-<!-- ``` -->
-
-```{r}
-## Make design matrix
-sample_col = "synth_samples"
-condition_col = "synth_labels"
-batch_col = NULL
-design_df <- as.tibble(colData(embryo_sce)[c(sample_col, condition_col, batch_col)]) %>%
-    distinct() %>%
-    column_to_rownames(sample_col)
-  if (is.null(batch_col)) {
-    design <- formula(paste('~', condition_col, collapse = ' '))  
-  } else {
-    design <- formula(paste('~', batch_col, "+", condition_col, collapse = ' '))
-  }
-
-milo_ls <- lapply(milo_ls, function(m){
-  ## Test DA
-  m <- countCells(m, meta.data = data.frame(colData(m)), sample='synth_samples')
-  m <- calcNhoodDistance(m, d=30, reduced.dim = "pca.corrected")
-  DA_results <- testNhoods(m, design = design, design.df = design_df)
-  return(list(Milo=m, da_res=DA_results))
-})
-
-milo_outcome <- lapply(seq_along(milo_ls), function(i) 
-  data.frame(pred=milo2output(milo_ls[[i]]$Milo, milo_ls[[i]]$da_res, out_type="labels"), 
-             true=milo_ls$`20`$Milo$true_labels,
-             method=names(milo_ls)[i])
-  ) %>%
-  purrr::reduce(bind_rows) %>%
-  calculate_outcome()
-
-milo_outcome %>%
-  ggplot(aes(method, Power)) + geom_point()
-
-milo_outcome %>%
-  ggplot(aes(method, TPR)) + geom_point()
-
-```
-
-
-```{r, fig.height=8, fig.width=8}
-milo_out2 <- run_milo(embryo_sce, condition_col="synth_labels", sample_col="synth_samples", reduced.dim="pca.corrected",
-         k=30, prop=0.1)
-
-milo_out2$Milo <- buildNhoodGraph(milo_out2$Milo)
-
-hist(rowSums(milo_out2$Milo@nhoods), breaks=100)
-
-milo_out2$DAres %>%
-  ggplot(aes(logFC, - log10(SpatialFDR))) + geom_point()
-plotNhoodSizeHist(milo_out2$Milo) / 
-  plotNhoodGraphDA(milo_out2$Milo, milo_out2$DAres)
-```
-
-### MELD
-
-```{r}
-meld_res_ls <- lapply(seq(20,50, by = 10), function(k){
-  meld_res <- run_meld_reticulate(embryo_sce, condition_col="synth_labels", sample_col="synth_samples", reduced.dim = "pca.corrected", d=30, k=k)
-  meld_out <- meld2output(meld_res, out_type = "labels")
-  meld_out
-})
-
-lapply(meld_res_ls)
-
-# meld_outcome <- 
-  lapply(seq_along(meld_res_ls), function(i) 
-  data.frame(pred=meld_res_ls[[i]], 
-             true=embryo_sce$true_labels,
-             method=seq(20,50, by = 10)[i])
-  ) %>%
-    purrr::reduce(bind_rows) %>%
-    mutate(pred=as.character(pred)) %>%
-    mutate(pred=case_when(pred=="PosLFC" ~ "NegLFC",
-                        pred=="NegLFC" ~ "PosLFC",
-                        TRUE ~ pred)) %>%
-    mutate(outcome=case_when(true==pred & pred!="NotDA" ~ 'TP',
-                             true!=pred & pred!="NotDA" ~ 'FP',
-                             true!=pred & pred=="NotDA" ~ 'FN',
-                             true==pred & pred=="NotDA"  ~ "TN"
-    )) %>%
-    group_by(method, outcome) %>%
-    summarise(n=n()) %>%
-    pivot_wider(id_cols=method, names_from=outcome, values_from=n, values_fill=0) %>%
-    mutate(TPR=TP/(TP+FP), FPR=FP/(TP+FP), TNR=TN/(TN+FN), FNR = FN/(FN+TP),
-           Power = 1 - FNR,
-           Accuracy = (TP + TN)/(TP + TN + FP + FN),
-           Recall = TP / (TP+FN)
-    )
-```
-
-```{r}
-sce <- embryo_sce[,1:5000]
-
-daseq_res <- run_daseq(sce, condition_col="synth_labels", k.vec = c(10,20,30))
-
-hist(daseq_res$da.ratio)
-```
-
-
-## + Batch effect 
-(the following code is wrapped in the `run_batch_benchmark.R` script but I am rerunning for viz)
-
-Visualize batch effects of different intensity
-
-```{r, fig.width=9, fig.height=8}
-embryo_sce <- readRDS("/nfs/team205/ed6/data/milo_benchmark/embryo_data_bm.RDS")
-
-seed=2024
-embryo_sce <- add_synthetic_labels(embryo_sce, 
-                                   n_components = 10,  
-                                   redDim='pca.corrected', 
-                                   seed=seed, 
-                                   n_replicates = 3)
-true_labels <- ifelse(embryo_sce$Condition2_prob < 0.4, "NegLFC", ifelse(embryo_sce$Condition2_prob > 0.6, "PosLFC", "NotDA"))
-colData(embryo_sce)[["true_labels"]] <- true_labels
-
-## Simulate batch effects of different magnitude
-bm_sce_ls <- lapply(c(0, 0.25, 0.75, 1), function(sd){
-  sce_be <- add_batch_effect(embryo_sce, norm_sd=sd, batch_col = "synth_batches")
-  sce_be$norm_sd <- sd
-  sce_be
-  })
-
-bm_sce_ls <- lapply(bm_sce_ls, function(x) runUMAP(x, dimred="pca_batch", name = 'umap_batch', n_dimred=1:30))
-
-wrap_plots(lapply(bm_sce_ls, function(x) plotReducedDim(x, dimred="umap_batch", colour_by="synth_batches", point_size=0.2) + 
-         ggtitle(paste0("Batch effect SD = ", x$norm_sd[1])))) +
-  plot_layout(ncol=2, nrow=2, guides="collect") &
-  guides(color=guide_legend(override.aes=list(size=2)))
-```
-
-```{r}
-lapply(bm_sce_ls, function(x) plotReducedDim(x, dimred="umap_batch", colour_by="true_labels", point_size=0.2) + 
-         ggtitle(paste0("Batch effect SD = ", x$norm_sd[1])))
-```
-
-
-
-### Load results from `run_batch_benchmark.R`
-
-```{r}
-.outcome_by_prob <- function(benchmark_df, da_upper){
-  DA_thresh <- 1 - da_upper
-  benchmark_df <- benchmark_df %>%
-  mutate(true = ifelse(true_prob < DA_thresh, "NegLFC", "NotDA")) 
-  if (benchmark_df$method[1]=="meld") {
-    benchmark_df <- mutate(benchmark_df, pred = ifelse(Condition2 < DA_thresh, "NegLFC", "NotDA")) 
-  }
-  ## Check if conditions were swapped in test
-  pred_cor <- benchmark_df %>%
-    mutate(pred=factor(pred, levels=c("NegLFC", "NotDA", "PosLFC"), ordered = TRUE)) %>%
-    mutate(pred=as.numeric(pred)) %>%
-    summarise(cor(pred, true_prob))
-  ## Swap outcomes if so
-  if (!is.na(pred_cor)) {
-    if (pred_cor < 0) {
-      benchmark_df <- mutate(benchmark_df, pred = ifelse(pred=="NegLFC", "PosLFC", ifelse(pred=="PosLFC", "NegLFC", "NotDA")))
-        }
-    }
-  
-  calculate_outcome(benchmark_df)
-}
-
-plot_prob_outcome <- function(out_prob_df, metric='TPR'){
-  out_prob_df %>%
-  mutate(FDR = FP/(TP+FP)) %>%
-  mutate(TPR=ifelse(is.nan(TPR), 0, TPR),
-         FPR=ifelse(is.nan(FPR), 0, FPR),
-                  FDR=ifelse(is.nan(FDR), 0, FDR),
-         Precision=ifelse(is.nan(Precision), 0, Precision)) %>%
-  rename(metric=metric) %>%
-  group_by(method, DA_thresh, batchEffect, enr) %>%
-  summarise(mean_metric=mean(metric), 
-            sd_metric=sd(metric)) %>%
-  ggplot(aes(DA_thresh, mean_metric, color=method)) +
-  geom_point(size=1, alpha=0.7) +
-  geom_ribbon(aes(ymin=mean_metric-sd_metric, ymax=mean_metric+sd_metric, fill=method), alpha=0.2, color=NA) +
-  geom_line() +
-  facet_grid(batchEffect~enr, labeller="label_both") +
-  xlab("probability threshold") +
-    ylab(paste("mean", metric)) +
-  xlim(0.5,0.9) +
-    theme_bw(base_size=16)
-  
-}
-
-## Method color palette
-method_names <- c("milo", "daseq", "meld", "louvain", "milo_batch", "louvain_batch")
+## Define color palette for methods
+method_names <- c("milo", "daseq", "meld", "louvain", "milo_batch", "louvain_batch","cydar")
 method_colors <- RColorBrewer::brewer.pal(length(method_names), name="Dark2")
 method_colors <- setNames(method_colors, method_names)
-method_labels <- c("Milo", "DAseq", "MELD", "Louvain", "Milo (~ batch + condition)", 'Louvain (~ batch + condition)')
+method_labels <- c("Milo", "DAseq", "MELD", "Louvain", "Milo (~ batch + condition)", 'Louvain (~ batch + condition)', "cydar")
+method_labels <- setNames(method_labels, method_names)
 
-outdir <- "/nfs/team205/ed6/data/milo_benchmark/"
-res_files <- list.files(outdir, pattern=".DAresults.+.csv")
-res_files_full <- list.files(outdir, pattern=".DAresults.+.csv", full.names = TRUE)
-in_files <- list.files("~/data/milo_benchmark/synthetic_data/", pattern="coldata.csv")
-
-## Make data frame w benchmark parameters
-out_meta_df <- data.frame(file_id = str_remove_all(res_files, "benchmark_embryo_pop_|.csv")) %>%
-  separate(col = file_id, sep = ".DAresults.", into=c("file_id", "method")) %>%
-  separate(col = file_id, sep = "_enr", into=c("pop", "file_id")) %>%
-  separate(col = file_id, sep = "_", into=c("enr", "seed", "batchEffect")) %>%
-  # mutate(MNNcorrected=ifelse('MNNcorrected' %in% batchEffect, TRUE, FALSE)) %>%
-  mutate(seed=str_remove(seed, "seed"), batchEffect=str_remove_all(batchEffect, "batchEffect|.MNNcorrected")) 
-
-out_meta_df %>%
-  filter(method=="louvain_batch" & MNNcorrected) %>%
-  ggplot(aes(pop, fill=batchEffect)) + geom_bar() + coord_flip()
+scale_color_methods <- function(){ scale_color_manual(values = method_colors, labels=method_labels) }
+scale_fill_methods <- function(){ scale_fill_manual(values = method_colors, labels=method_labels) }
 ```
 
+<!-- ```{r} -->
+<!-- # outdir <- "/nfs/team205/ed6/data/milo_benchmark/embryo/" -->
+<!-- # res_files <- list.files(outdir, pattern=".DAresults.+.csv") -->
+<!-- # res_files_full <- list.files(outdir, pattern=".DAresults.+.csv", full.names = TRUE) -->
+<!-- # in_files <- list.files("~/data/milo_benchmark/synthetic_data/", pattern="coldata.csv") -->
+<!-- #  -->
+<!-- # ## Make data frame w benchmark parameters -->
+<!-- # out_meta_df <- data.frame(file_id = str_remove_all(res_files, "benchmark_embryo_pop_|.csv")) %>% -->
+<!-- #   separate(col = file_id, sep = ".DAresults.", into=c("file_id", "method")) %>% -->
+<!-- #   separate(col = file_id, sep = "_enr", into=c("pop", "file_id")) %>% -->
+<!-- #   separate(col = file_id, sep = "_", into=c("enr", "seed", "batchEffect")) %>% -->
+<!-- #   # mutate(MNNcorrected=ifelse('MNNcorrected' %in% batchEffect, TRUE, FALSE)) %>% -->
+<!-- #   mutate(seed=str_remove(seed, "seed"), batchEffect=str_remove_all(batchEffect, "batchEffect|.MNNcorrected"))  -->
+<!-- #  -->
+<!-- # out_meta_df %>% -->
+<!-- #   filter(method=="louvain_batch" & MNNcorrected) %>% -->
+<!-- #   ggplot(aes(pop, fill=batchEffect)) + geom_bar() + coord_flip() -->
+<!-- ``` -->
 
-```{r, warning=FALSE, message=FALSE}
-## Read DA predictions
-prob_thresh_vec <- seq(0.5, 0.9, 0.05)
 
-outcome_df <- lapply(seq_along(res_files_full), function(i){ 
-  print(paste("Outcome no. ", i))
-  benchmark_df <- read_csv(res_files_full[i])
-  pop_enr <- as.numeric(out_meta_df[i,"enr"])
-  lapply(prob_thresh_vec[prob_thresh_vec < pop_enr], function(x){
-    benchmark_df %>%
-      .outcome_by_prob(da_upper = x) %>%
-      mutate(DA_thresh=x) %>%
-      ungroup() %>%
-      dplyr::select(- method) %>%
-      bind_cols(out_meta_df[i,]) %>%
-      filter(DA_thresh < as.numeric(enr))
-    }) %>%
-    purrr::reduce(bind_rows)
-  }) %>%
-  purrr::reduce(bind_rows)
+<!-- ```{r, warning=FALSE, message=FALSE} -->
+<!-- ## Read DA predictions -->
+<!-- prob_thresh_vec <- seq(0.5, 0.9, 0.05) -->
 
-write_csv(outcome_df, "/nfs/team205/ed6/data/milo_benchmark/outcome_full.csv")
-```
+<!-- outcome_df <- lapply(seq_along(res_files_full), function(i){  -->
+<!--   print(paste("Outcome no. ", i)) -->
+<!--   benchmark_df <- read_csv(res_files_full[i]) -->
+<!--   pop_enr <- as.numeric(out_meta_df[i,"enr"]) -->
+<!--   lapply(prob_thresh_vec[prob_thresh_vec < pop_enr], function(x){ -->
+<!--     benchmark_df %>% -->
+<!--       .outcome_by_prob(da_upper = x) %>% -->
+<!--       mutate(DA_thresh=x) %>% -->
+<!--       ungroup() %>% -->
+<!--       dplyr::select(- method) %>% -->
+<!--       bind_cols(out_meta_df[i,]) %>% -->
+<!--       filter(DA_thresh < as.numeric(enr)) -->
+<!--     }) %>% -->
+<!--     purrr::reduce(bind_rows) -->
+<!--   }) %>% -->
+<!--   purrr::reduce(bind_rows) -->
+
+<!-- write_csv(outcome_df, "/nfs/team205/ed6/data/milo_benchmark/outcome_full.csv") -->
+<!-- ``` -->
+
+Read outcome for embryo
 
 ```{r}
-outcome_df <- read_csv("/nfs/team205/ed6/data/milo_benchmark/outcome_full.csv")
+outcome_df <- read_csv("/nfs/team205/ed6/data/milo_benchmark/outcome_embryo_full.csv")
+outcome_cydar_batch_df <- read_csv("/nfs/team205/ed6/data/milo_benchmark/outcome_embryo_cydar_batch.csv")
+
+outcome_df <- bind_rows(outcome_df, outcome_cydar_batch_df)
 ```
 
 Motivate threshold
 ```{r, warning=FALSE, message=FALSE, fig.width=10, fig.height=4}
 metric="TPR"
+
 pl_thr_1 <- outcome_df %>%
-  filter(batchEffect==0 & method!="milo_batch") %>%
+  filter(batchEffect==0 & str_detect(method, "_batch", negate = TRUE)) %>%
   mutate(FDR = FP/(TP+FP)) %>%
   mutate(TPR=ifelse(is.nan(TPR), 0, TPR),
          FPR=ifelse(is.nan(FPR), 0, FPR),
@@ -633,10 +187,8 @@ pl_thr_1 <- outcome_df %>%
   geom_ribbon(aes(ymin=mean_metric-sd_metric, ymax=mean_metric+sd_metric, fill=method), alpha=0.2, color=NA) +
   geom_line() +
   geom_vline(linetype=2, xintercept = 0.6, alpha=0.8) +
-  # geom_smooth() +
-  scale_color_manual(values = method_colors, labels=setNames(method_labels, method_names)) +
-  scale_fill_manual(values = method_colors, labels=setNames(method_labels, method_names)) +
-  # facet_grid(batchEffect~., labeller="label_both") +
+  scale_color_methods() +
+  scale_fill_methods() +
   xlab("probability threshold") +
     ylab(paste("mean", metric)) +
   xlim(0.5,0.9) +
@@ -644,7 +196,7 @@ pl_thr_1 <- outcome_df %>%
 
 metric="FDR"
 pl_thr_2 <- outcome_df %>%
-  filter(batchEffect==0 & method!="milo_batch") %>%
+  filter(batchEffect==0 & str_detect(method, "_batch", negate = TRUE)) %>%
   mutate(FDR = FP/(TP+FP)) %>%
   mutate(TPR=ifelse(is.nan(TPR), 0, TPR),
          FPR=ifelse(is.nan(FPR), 0, FPR),
@@ -659,23 +211,28 @@ pl_thr_2 <- outcome_df %>%
   geom_ribbon(aes(ymin=mean_metric-sd_metric, ymax=mean_metric+sd_metric, fill=method), alpha=0.2, color=NA) +
   geom_line() +
   geom_vline(linetype=2, xintercept = 0.6, alpha=0.8) +
-  scale_color_manual(values = method_colors, labels=setNames(method_labels, method_names)) +
-  scale_fill_manual(values = method_colors, labels=setNames(method_labels, method_names)) +
+  scale_color_methods() +
+  scale_fill_methods() +
   # facet_grid(batchEffect~., labeller="label_both") +
   xlab("probability threshold") +
     ylab(paste("mean", metric)) +
   xlim(0.5,0.9) +
     theme_bw(base_size=16) 
 
-pl_thr_1 + pl_thr_2 + plot_layout(guides="collect") +
-  ggsave(paste0(figdir, 'bm_prob_thresh.pdf'), height = 3, width = 8)
+pl_thr_1 + pl_thr_2 + plot_layout(guides="collect") 
+  ggsave(paste0(figdir, 'bm_prob_thresh.pdf'), height = 3, width = 8, useDingbats=FALSE)
 ```
+
 ```{r}
 outcome_df <- outcome_df %>%
   filter(DA_thresh==0.6) 
+```
+
+
+```{r}
 
 pl_df <- outcome_df %>%
-  filter(method!="milo_batch") %>%
+  filter(batchEffect==0 & str_detect(method, "_batch", negate = TRUE)) %>%
   mutate(FDR = FP/(TP+FP)) %>%
   mutate(TPR=ifelse(is.nan(TPR), 0, TPR),
          FPR=ifelse(is.nan(FPR), 0, FPR),
@@ -714,8 +271,8 @@ Breakdown by population: explain variability in MELD, population size
 ```{r, fig.width=8, fig.height=7, message=FALSE}
 pop_sizes <- table(embryo_sce$celltype)
 
-outcome_df %>%
-  filter(method!="milo_batch") %>%
+pl_df <- outcome_df %>%
+  filter(batchEffect==0 & str_detect(method, "_batch", negate = TRUE)) %>%
   mutate(FDR = FP/(TP+FP)) %>%
   mutate(TPR=ifelse(is.nan(TPR), 0, TPR),
          FPR=ifelse(is.nan(FPR), 0, FPR),
@@ -725,62 +282,83 @@ outcome_df %>%
   mutate(pop_size=pop_sizes[pop])  %>%
   arrange(pop_size) %>%
   mutate(pop=factor(pop, levels=unique(pop))) %>%
-  filter(DA_thresh >= 0.6 & batchEffect==0) %>%
+  filter(DA_thresh >= 0.6 & batchEffect==0) 
+
+pl1 <- pl_df %>%
   ggplot(aes(pop_size, TPR, color=method)) + 
   geom_point(size=2, alpha=0.7) +
   facet_grid(enr~., labeller="label_both") +
-  geom_smooth(method="lm") +
+  geom_smooth(method="loess", span=3) +
   theme_bw(base_size = 16) +
   scale_color_manual(values = method_colors, labels=setNames(method_labels, method_names)) +
   scale_fill_manual(values = method_colors, labels=setNames(method_labels, method_names)) +
   xlab("Size of DA population") +
   xlim(0,7000) +
-  ggpubr::stat_cor(label.x.npc = 1, label.y.npc = 1, hjust = 1) +
-  ggsave(paste0(figdir, "pop_size.png"), height = 7, width = 8)
+  # geom_segment(linetype=2, alpha=0.8, x=-1,xend=4500, y=0.8, yend=0.8) +
+  ggpubr::stat_cor(label.x.npc = 1, label.y.npc = 1, hjust = 1) 
+
+pl2 <- pl_df %>%
+  ggplot(aes(pop_size, FDR, color=method)) + 
+  geom_point(size=2, alpha=0.7) +
+  facet_grid(enr~., labeller="label_both") +
+  geom_smooth(method="loess", span=3) +
+  theme_bw(base_size = 16) +
+  scale_color_manual(values = method_colors, labels=setNames(method_labels, method_names)) +
+  scale_fill_manual(values = method_colors, labels=setNames(method_labels, method_names)) +
+  xlab("Size of DA population") +
+  xlim(0,7000) +
+  # coord_cartesian(ylim=c(0,1)) +
+  geom_hline(yintercept = 0.1, linetype=2) +
+  ggpubr::stat_cor(label.x.npc = 1, label.y.npc = 1, hjust = 1, 
+                   ) 
 
 
+((pl1 + pl2 ) + plot_layout(guides="collect") &
+  theme(legend.position = "top")) +
+  ggsave(paste0(figdir, "pop_size.png"), height = 7, width = 12,) +
+  ggsave(paste0(figdir, "pop_size.pdf"), height = 7, width = 12, useDingbats=FALSE)
 
 ```
 
 
 ## Batch effect
 
-Load louvain_batch
-```{r}
-res_files <- list.files(outdir, pattern="batchEffect.{1,4}.DAresults.louvain_batch.csv")
-res_files_full <- list.files(outdir, pattern="batchEffect.{1,4}.DAresults.louvain_batch.csv", full.names = TRUE)
-in_files <- list.files("~/data/milo_benchmark/synthetic_data/", pattern="coldata.csv")
+<!-- Load louvain_batch -->
+<!-- ```{r} -->
+<!-- res_files <- list.files(outdir, pattern="batchEffect.{1,4}.DAresults.louvain_batch.csv") -->
+<!-- res_files_full <- list.files(outdir, pattern="batchEffect.{1,4}.DAresults.louvain_batch.csv", full.names = TRUE) -->
+<!-- in_files <- list.files("~/data/milo_benchmark/synthetic_data/", pattern="coldata.csv") -->
 
-## Make data frame w benchmark parameters
-louvain_out_meta_df <- data.frame(file_id = str_remove_all(res_files, "benchmark_embryo_pop_|.csv")) %>%
-  separate(col = file_id, sep = ".DAresults.", into=c("file_id", "method")) %>%
-  separate(col = file_id, sep = "_enr", into=c("pop", "file_id")) %>%
-  separate(col = file_id, sep = "_", into=c("enr", "seed", "batchEffect")) %>%
-  # mutate(MNNcorrected=ifelse('MNNcorrected' %in% batchEffect, TRUE, FALSE)) %>%
-  mutate(seed=str_remove(seed, "seed"), batchEffect=str_remove_all(batchEffect, "batchEffect|.MNNcorrected")) 
+<!-- ## Make data frame w benchmark parameters -->
+<!-- louvain_out_meta_df <- data.frame(file_id = str_remove_all(res_files, "benchmark_embryo_pop_|.csv")) %>% -->
+<!--   separate(col = file_id, sep = ".DAresults.", into=c("file_id", "method")) %>% -->
+<!--   separate(col = file_id, sep = "_enr", into=c("pop", "file_id")) %>% -->
+<!--   separate(col = file_id, sep = "_", into=c("enr", "seed", "batchEffect")) %>% -->
+<!--   # mutate(MNNcorrected=ifelse('MNNcorrected' %in% batchEffect, TRUE, FALSE)) %>% -->
+<!--   mutate(seed=str_remove(seed, "seed"), batchEffect=str_remove_all(batchEffect, "batchEffect|.MNNcorrected"))  -->
 
-# louvain_out_meta_df %>%
-#   filter(method=="louvain_batch") %>%
-#   ggplot(aes(pop, fill=batchEffect)) + geom_bar() + coord_flip()
+<!-- # louvain_out_meta_df %>% -->
+<!-- #   filter(method=="louvain_batch") %>% -->
+<!-- #   ggplot(aes(pop, fill=batchEffect)) + geom_bar() + coord_flip() -->
 
-## Load results
-louvainb_outcome_df <- lapply(seq_along(res_files_full), function(i){ 
-  print(paste("Outcome no. ", i))
-  benchmark_df <- read_csv(res_files_full[i]) %>%
-      .outcome_by_prob(da_upper = 0.6) %>%
-      mutate(DA_thresh=0.6) %>%
-      ungroup() %>%
-      dplyr::select(- method) %>%
-      bind_cols(louvain_out_meta_df [i,]) 
-  pop_enr <- as.numeric(louvain_out_meta_df [i,"enr"])
-  benchmark_df
-  }) %>%
-  purrr::reduce(bind_rows) %>%
-  filter(enr > 0.6) 
+<!-- ## Load results -->
+<!-- louvainb_outcome_df <- lapply(seq_along(res_files_full), function(i){  -->
+<!--   print(paste("Outcome no. ", i)) -->
+<!--   benchmark_df <- read_csv(res_files_full[i]) %>% -->
+<!--       .outcome_by_prob(da_upper = 0.6) %>% -->
+<!--       mutate(DA_thresh=0.6) %>% -->
+<!--       ungroup() %>% -->
+<!--       dplyr::select(- method) %>% -->
+<!--       bind_cols(louvain_out_meta_df [i,])  -->
+<!--   pop_enr <- as.numeric(louvain_out_meta_df [i,"enr"]) -->
+<!--   benchmark_df -->
+<!--   }) %>% -->
+<!--   purrr::reduce(bind_rows) %>% -->
+<!--   filter(enr > 0.6)  -->
 
-louvainb_outcome_df <- louvainb_outcome_df %>%
-  mutate(seed=as.numeric(seed), batchEffect=as.numeric(batchEffect), enr=as.numeric(enr))
-```
+<!-- louvainb_outcome_df <- louvainb_outcome_df %>% -->
+<!--   mutate(seed=as.numeric(seed), batchEffect=as.numeric(batchEffect), enr=as.numeric(enr)) -->
+<!-- ``` -->
 
 
 <!-- ```{r, fig.width=12, fig.height=10} -->
@@ -1024,12 +602,14 @@ louvainb_outcome_df <- louvainb_outcome_df %>%
 ```{r, fig.height=8, fig.width=8}
 
 pl_df <- outcome_df %>%
-  bind_rows(louvainb_outcome_df) %>%
+  filter(method != "milo" & method != "louvain" & method != "cydar_batch") %>%
   mutate(FDR = FP/(TP+FP)) %>%
   mutate(TPR=ifelse(is.nan(TPR), 0, TPR),
          FPR=ifelse(is.nan(FPR), 0, FPR),
           FDR=ifelse(is.nan(FDR), 0, FDR),
-         Precision=ifelse(is.nan(Precision), 0, Precision)) 
+         Precision=ifelse(is.nan(Precision), 0, Precision)) %>%
+  mutate(method=str_remove(method,"_batch"))
+
 metric='TPR'
 pl_left<- pl_df %>%
   rename(metric=metric) %>%
@@ -1037,18 +617,17 @@ pl_left<- pl_df %>%
   summarise(mean_metric=mean(metric), 
             sd_metric=sd(metric)) %>%
   mutate(group=paste(method, enr)) %>%
-  filter(method != "milo" & method != "louvain") %>%
   ggplot(aes(as.numeric(batchEffect), mean_metric, color=method)) +
     geom_line() +
   geom_ribbon(aes(ymin=mean_metric-sd_metric, ymax=mean_metric+sd_metric, fill=method), alpha=0.2, color=NA) +
   geom_point(size=3) +
   facet_grid(enr~., labeller="label_both") +
   xlab("Batch effect magnitude") +
-    ylab(paste("mean", metric)) +
-    theme_bw(base_size=16) +
-    scale_color_manual(values = method_colors, labels=setNames(method_labels, method_names)) +
-  scale_fill_manual(values = method_colors, labels=setNames(method_labels, method_names)) +
-  geom_hline(yintercept = 0.8, linetype=2) 
+  ylab(paste("mean", metric)) +
+  theme_bw(base_size=16) +
+  geom_hline(yintercept = 0.8, linetype=2) +
+  scale_color_manual(values = method_colors, labels=c(milo="Milo (~ batch + condition)", meld='MELD', louvain="Louvain (~ batch + condition)", daseq="DAseq", cydar="Cydar")) +
+  scale_fill_manual(values = method_colors, labels=c(milo="Milo (~ batch + condition)", meld='MELD', louvain="Louvain (~ batch + condition)", daseq="DAseq", cydar="Cydar"))
 
 metric = "FDR"
 pl_right <- pl_df %>%
@@ -1057,7 +636,6 @@ pl_right <- pl_df %>%
   summarise(mean_metric=mean(metric), 
             sd_metric=sd(metric)) %>%
   mutate(group=paste(method, enr)) %>%
-  filter(method != "milo" & method != "louvain") %>%
   ggplot(aes(as.numeric(batchEffect), mean_metric, color=method)) +
   geom_line() +
   geom_ribbon(aes(ymin=mean_metric-sd_metric, ymax=mean_metric+sd_metric, fill=method), alpha=0.2, color=NA) +
@@ -1068,12 +646,76 @@ pl_right <- pl_df %>%
     ylab(paste("mean", metric)) +
     theme_bw(base_size=16) +
   geom_hline(yintercept = 0.1, linetype=2) +
-    scale_color_manual(values = method_colors, labels=setNames(method_labels, method_names)) +
-  scale_fill_manual(values = method_colors, labels=setNames(method_labels, method_names)) 
+  scale_color_manual(values = method_colors, labels=c(milo="Milo (~ batch + condition)", meld='MELD', louvain="Louvain (~ batch + condition)", daseq="DAseq", cydar="Cydar")) +
+  scale_fill_manual(values = method_colors, labels=c(milo="Milo (~ batch + condition)", meld='MELD', louvain="Louvain (~ batch + condition)", daseq="DAseq", cydar="Cydar"))
 
 pl_left + pl_right + plot_layout(guides="collect") +
-  ggsave(paste0(figdir, "batchEffect_linear.png"), height = 7, width = 10) 
+  ggsave(paste0(figdir, "batchEffect_linear.png"), height = 7, width = 12) +
+  ggsave(paste0(figdir, "batchEffect_linear.pdf"), height = 7, width = 12, useDingbats=FALSE)
 ```
+
+W and w/o batch control
+
+```{r}
+pl_df <- outcome_df %>%
+  filter(method %in% c("milo", "milo_batch")) %>%
+  mutate(FDR = FP/(TP+FP)) %>%
+  mutate(TPR=ifelse(is.nan(TPR), 0, TPR),
+         FPR=ifelse(is.nan(FPR), 0, FPR),
+          FDR=ifelse(is.nan(FDR), 0, FDR),
+         Precision=ifelse(is.nan(Precision), 0, Precision)) %>%
+  mutate(design = ifelse(str_detect(method,"_batch"), "~ batch + condition", "~ condition"))
+
+metric='TPR'
+pl_left<-
+  pl_df %>%
+  rename(metric=metric) %>%
+  group_by(method, DA_thresh, batchEffect, enr, design) %>%
+  summarise(mean_metric=mean(metric), 
+            sd_metric=sd(metric)) %>%
+  mutate(group=paste(method)) %>%
+  mutate(method=str_remove(method, "_batch")) %>%
+  ggplot(aes(as.numeric(batchEffect), mean_metric, group=group, color=method, linetype=design, shape=design)) +
+    geom_line() +
+  geom_ribbon(aes(ymin=mean_metric-sd_metric, ymax=mean_metric+sd_metric, fill=method), alpha=0.2, color=NA) +
+  geom_point(size=3) +
+  facet_grid(enr~., labeller="label_both") +
+  xlab("Batch effect magnitude") +
+  ylab(paste("mean", metric)) +
+  theme_bw(base_size=16) +
+  geom_hline(yintercept = 0.8, linetype=2) +
+  scale_color_manual(values = method_colors, labels=c(milo="Milo", louvain="Louvain", cydar="Cydar")) +
+  scale_fill_manual(values = method_colors, labels=c(milo="Milo", louvain="Louvain", cydar="Cydar")) 
+
+metric = "FDR"
+pl_right <- 
+  pl_df %>%
+  rename(metric=metric) %>%
+  group_by(method, DA_thresh, batchEffect, enr, design) %>%
+  summarise(mean_metric=mean(metric), 
+            sd_metric=sd(metric)) %>%
+  mutate(group=paste(method)) %>%
+  mutate(method=str_remove(method, "_batch")) %>%
+  ggplot(aes(as.numeric(batchEffect), mean_metric, group=group, color=method, linetype=design, shape=design)) +
+    geom_line() +
+  geom_ribbon(aes(ymin=mean_metric-sd_metric, ymax=mean_metric+sd_metric, fill=method), alpha=0.2, color=NA) +
+  geom_point(size=3) +
+  facet_grid(enr~., labeller="label_both") +
+  xlab("Batch effect magnitude") +
+  ylab(paste("mean", metric)) +
+  theme_bw(base_size=16) +
+  geom_hline(yintercept = 0.1, linetype=2) +
+  ylim(0,1) +
+  scale_color_manual(values = method_colors, labels=c(milo="Milo", louvain="Louvain", cydar="Cydar")) +
+  scale_fill_manual(values = method_colors, labels=c(milo="Milo", louvain="Louvain", cydar="Cydar")) 
+
+design_plot <- pl_left + pl_right +
+  plot_layout(guides="collect") +
+  ggsave(paste0(figdir, "batchEffect_design.png"), height = 6, width = 10) +
+  ggsave(paste0(figdir, "batchEffect_design.pdf"), height = 6, width = 10, useDingbats=FALSE)
+```
+
+
 
 Visualize outcome in UMAP
 
@@ -1163,12 +805,13 @@ Plot benchmark design
 
 ```{r, fig.height=4, fig.width=13}
 sce <- read_input_data(embryo_sce = embryo_sce, indir=indir, pop="Mesenchyme", enr=0.9, seed=44, batchEffect=0, run_umap = FALSE)
-umap_bath_df <- data.frame(reducedDim(sce, "umap_batch")) 
+umap_bath_df <- data.frame(reducedDim(sce, "UMAP")) 
+library(ggrastr)
 
 p1 <- umap_bath_df %>%
     rename(UMAP1=X1, UMAP2=X2) %>%
     ggplot(aes(UMAP1, UMAP2)) + 
-    geom_point(size=0.1, color="grey") +
+    geom_point_rast(size=0.1, raster.dpi = 500) +
     theme_classic(base_size=16) +
       guides(color=guide_colorbar(title.position="top", title.hjust = 0.5)) +
      theme(axis.ticks = element_blank(),
@@ -1183,33 +826,39 @@ p2 <- umap_bath_df %>%
     mutate(true=ifelse(true < 0.5, 0.5, true)) %>%
     arrange(true) %>%
     ggplot(aes(UMAP1, UMAP2, color=true)) + 
-    geom_point(size=0.1) +
+    geom_point_rast(size=0.1, raster.dpi = 500) +
       scale_color_viridis_c(name="C1 probability") +
     theme_classic(base_size=14) +
       guides(color=guide_colorbar(title.position="left", title.hjust = 1, title.vjust = 1, barwidth = 0.5, barheight = 3)) +
      theme(axis.ticks = element_blank(),
            axis.text = element_blank(),
            legend.position = c(0.75,0.85), legend.background = element_blank()) +
-     xlab("UMAP1") + ylab("UMAP2") +
+     xlab("UMAP1") + ylab("UMAP2") 
   rasterize(geom_point(size=0.1), dpi = 300)
 
 p3 <- umap_bath_df %>%
     rename(UMAP1=X1, UMAP2=X2) %>%
     mutate(true_labels=sce$synth_labels) %>%
     ggplot(aes(UMAP1, UMAP2, color=true_labels)) + 
-    geom_point(size=0.1) +
+    geom_point_rast(size=0.1, raster.dpi = 500) +
     scale_color_brewer(palette="Set1", labels=c(Condition1='C1', Condition2="C2"), name="") +
     theme_classic(base_size=16) +
      guides(color=guide_legend(override.aes = list(size=2))) +
      theme(axis.ticks = element_blank(),
            axis.text = element_blank(),
            legend.position = c(0.85,0.95), legend.background = element_blank()) +
-     xlab("UMAP1") + ylab("UMAP2") +
-  rasterize(geom_point(size=0.1), dpi = 300)
+     xlab("UMAP1") + ylab("UMAP2") 
 
 (p1 + p2 + p3) 
 
 ```
+
+```{r}
+reducedDim(embryo_sce, "UMAP") %>%
+  ggplot(aes(data))
+```
+
+
 
 Design matrix
 ```{r, fig.height=4, fig.width=13}
@@ -1220,7 +869,7 @@ des_pl <- data.frame(colData(sce)[,c("synth_labels", "synth_samples")]) %>%
   pivot_wider(id_cols = synth_samples, names_from=synth_labels, values_from=count,values_fill=0) %>%
   pivot_longer(cols=c(C1, C2), names_to="synth_labels") %>%
   ggplot(aes(synth_labels, synth_samples)) +
-  geom_tile(fill="white", color="black", size=1) +
+  geom_tile(fill="white", color="black", size=0.8) +
   geom_tile(data=. %>% filter(value>0), aes(fill=synth_labels), color="black", size=1) +
   theme_classic(base_size=16)   +
   scale_fill_brewer(palette="Set1") +
@@ -1231,29 +880,29 @@ des_pl <- data.frame(colData(sce)[,c("synth_labels", "synth_samples")]) %>%
 
 (p1 + p2 + p3) + des_pl +
   plot_layout(widths=c(1,1,1,0.2), ncol=4) +
+  ggsave(paste0(figdir, "bm_example.pdf"), height = 4, width = 12) +
   ggsave(paste0(figdir, "bm_example.png"), height = 4, width = 12)
 ```
 
 
 
-```{r, fig.height=8, fig.width=8}
-pops <- sample(unique(outcome_df$pop), 3)
 
-p1 <- lapply(pops, function(p) plot_outcome_umap(sce, 'milo', p, 0.7, seed, batchEffect, true=TRUE, rasterize=TRUE))
-p2 <- lapply(pops, function(p) plot_outcome_umap(sce, 'milo', p, 0.8, seed, batchEffect, true=TRUE, rasterize=TRUE))
-p3 <- lapply(pops, function(p) plot_outcome_umap(sce, 'milo', p, 0.9, seed, batchEffect, true=TRUE, rasterize=TRUE))
+<!-- ```{r, fig.height=8, fig.width=8} -->
+<!-- pops <- sample(unique(outcome_df$pop), 3) -->
 
-fig <- (wrap_plots(p1) /
-  wrap_plots(p2) /
-  wrap_plots(p3)) +
-  plot_layout(guides="collect") &
-  theme(legend.position = "right") 
+<!-- p1 <- lapply(pops, function(p) plot_outcome_umap(sce, 'milo', p, 0.7, seed, batchEffect, true=TRUE, rasterize=TRUE)) -->
+<!-- p2 <- lapply(pops, function(p) plot_outcome_umap(sce, 'milo', p, 0.8, seed, batchEffect, true=TRUE, rasterize=TRUE)) -->
+<!-- p3 <- lapply(pops, function(p) plot_outcome_umap(sce, 'milo', p, 0.9, seed, batchEffect, true=TRUE, rasterize=TRUE)) -->
 
-fig +
-  ggsave(paste0(figdir, "bm_design_UMAPs.png"), height = 8, width = 10)
-```
+<!-- fig <- (wrap_plots(p1) / -->
+<!--   wrap_plots(p2) / -->
+<!--   wrap_plots(p3)) + -->
+<!--   plot_layout(guides="collect") & -->
+<!--   theme(legend.position = "right")  -->
 
-
+<!-- fig + -->
+<!--   ggsave(paste0(figdir, "bm_design_UMAPs.png"), height = 8, width = 10) -->
+<!-- ``` -->
 
 Plot batch effect
 
@@ -1263,8 +912,29 @@ be_sce_ls <- lapply(c('0',"0.25", "0.5", "0.75", "1"), function(x) read_input_da
 
 method="milo"
 
+pop
 ## Plot condition probability 
-be_pl_ls <- lapply(be_sce_ls, function(x) plot_outcome_umap(x, method, pop, enr, seed, batchEffect, true=TRUE))
+be_pl_ls <- lapply(be_sce_ls, function(sce) {
+  coldata_file <- list.files(indir, pattern=paste0(pop,".+", "enr",enr,".+",'seed', seed, ".coldata.csv"),
+                           full.names = TRUE)
+  colData(sce) <- DataFrame(read_csv(coldata_file) %>% column_to_rownames())
+  data.frame(reducedDim(sce, "umap_batch")) %>%
+rename(UMAP1=X1, UMAP2=X2) %>%
+    mutate(true=sce$Condition1_prob) %>%
+    mutate(true=ifelse(true < 0.5, 0.5, true)) %>%
+    arrange(true) %>%
+    ggplot(aes(UMAP1, UMAP2, color=true)) + 
+    geom_point_rast(size=0.1, raster.dpi = 500) +
+      scale_color_viridis_c(name="C1 probability") +
+    theme_classic(base_size=14) +
+      guides(color=guide_colorbar(title.position="left", title.hjust = 1, title.vjust = 1, barwidth = 0.5, barheight = 3)) +
+     theme(axis.ticks = element_blank(),
+           axis.text = element_blank(),
+           legend.position = c(0.75,0.85), legend.background = element_blank()) +
+     xlab("UMAP1") + ylab("UMAP2") 
+  }
+)
+
 
 ## Plot batch
 be_pl_ls2 <- lapply(be_sce_ls, function(sce) {
@@ -1275,23 +945,24 @@ be_pl_ls2 <- lapply(be_sce_ls, function(sce) {
     rename(UMAP1=X1, UMAP2=X2) %>%
     mutate(true=sce$synth_batches) %>%
     ggplot(aes(UMAP1, UMAP2, color=true)) +
-    geom_point(size=0.1) +
+    geom_point_rast(size=0.1, raster.dpi = 500) +
     scale_color_viridis_d(name="Batch", option="cividis") +
      theme_classic(base_size=18) +
       guides(color=guide_legend(override.aes = list(size=2))) +
      theme(axis.ticks = element_blank(),
            axis.text = element_blank()) +
-     xlab("UMAP1") + ylab("UMAP2") +
-      rasterize(geom_point(size=0.1), dpi = 300)
+     xlab("UMAP1") + ylab("UMAP2") 
   }
 )
-    
-ptop <- wrap_plots(be_pl_ls, nrow=1, guides="collect") &
-  theme(legend.position = "right") 
-pbottom <- wrap_plots(be_pl_ls2, nrow=1, guides="collect")
 
-(ptop / pbottom) +
-  ggsave(paste0(figdir, "batchEffect_UMAPs.pdf"), height=6, width = 13)
+ptop <- wrap_plots(be_pl_ls, ncol=1, guides="collect") &
+  theme(legend.position = "right") 
+pbottom <- wrap_plots(be_pl_ls2, ncol=1, guides="collect")
+
+(ptop | pbottom) +
+  plot_layout(guides="collect") +
+  ggsave(paste0(figdir, "batchEffect_UMAPs.pdf"), height=13, width = 8) +
+  ggsave(paste0(figdir, "batchEffect_UMAPs.png"), height=13, width = 8)
 ```
 
 Design matrix w batch effect
@@ -1332,7 +1003,7 @@ m2 <- data.frame(colData(sce)[,c("synth_labels", "synth_samples", 'synth_batches
 (m1 + m2) +
 # (p1 + p2 + p3) + des_pl +
   plot_layout(widths=c(1,1), ncol=2) +
-  ggsave(paste0(figdir, "bm_design_batch.png"), height = 4, width = 4)
+  ggsave(paste0(figdir, "bm_design_batch.pdf"), height = 4, width = 4)
 ```
 
 <!-- ```{r, message=FALSE, warning=FALSE, fig.height=8, fig.width=14} -->
@@ -1614,9 +1285,31 @@ for (pop in pops) {
 Read all results
 
 ```{r}
-outdir <- "/nfs/team205/ed6/data/milo_benchmark/"
-res_files <- list.files(outdir, pattern=".+MNNcorrected.+DAresults.+.csv")
-res_files_full <- list.files(outdir, pattern=".+MNNcorrected.+DAresults.+.csv", full.names = TRUE)
+.outcome_by_prob <- function(benchmark_df, da_upper){
+  DA_thresh <- 1 - da_upper
+  benchmark_df <- benchmark_df %>%
+    mutate(true = ifelse(true_prob < DA_thresh, "NegLFC", "NotDA")) 
+  if (benchmark_df$method[1]=="meld") {
+    benchmark_df <- mutate(benchmark_df, pred = ifelse(Condition2 < DA_thresh, "NegLFC", "NotDA")) 
+  }
+  ## Check if conditions were swapped in test
+  pred_cor <- benchmark_df %>%
+    mutate(pred=factor(pred, levels=c("NegLFC", "NotDA", "PosLFC"), ordered = TRUE)) %>%
+    mutate(pred=as.numeric(pred)) %>%
+    summarise(cor(pred, true_prob))
+  ## Swap outcomes if so
+  if (!is.na(pred_cor)) {
+    if (pred_cor < 0) {
+      benchmark_df <- mutate(benchmark_df, pred = ifelse(pred=="NegLFC", "PosLFC", ifelse(pred=="PosLFC", "NegLFC", "NotDA")))
+    }
+  }
+  calculate_outcome(benchmark_df)
+}
+
+
+outdir <- "/nfs/team205/ed6/data/milo_benchmark/MNN_corrected/"
+res_files <- list.files(outdir, pattern=".+DAresults.+.csv")
+res_files_full <- list.files(outdir, pattern=".+DAresults.+.csv", full.names = TRUE)
 # in_files <- list.files("~/data/milo_benchmark/synthetic_data/", pattern="_enr0.[78].+coldata.csv")
 
 ## Make data frame w benchmark parameters
@@ -1664,7 +1357,8 @@ pl_df <- mnn_outcome_df %>%
   mutate(pop=str_replace(pop, "_", " ")) %>%
   mutate(pop_size=pop_sizes[pop])  %>%
   arrange(pop_size) %>%
-  mutate(pop=factor(pop, levels=unique(pop))) 
+  mutate(pop=factor(pop, levels=unique(pop))) %>%
+  mutate(seed=as.numeric(seed), enr=as.numeric(enr), batchEffect=as.numeric(batchEffect))
 
 pl_top <- bind_rows(mutate(no_be, class="no Batch Effect"),
   mutate(uncorrected_be, class="Uncorrected"),
@@ -1675,12 +1369,12 @@ pl_top <- bind_rows(mutate(no_be, class="no Batch Effect"),
          FPR=ifelse(is.nan(FPR), 0, FPR),
          FDR=ifelse(is.nan(FDR), 0, FDR),
          Precision=ifelse(is.nan(Precision), 0, Precision)) %>%
-  filter(method != "milo_batch" & method !="louvain_batch") %>%
+  filter(method != "milo_batch" & method !="louvain_batch" & method !="cydar_batch") %>%
   ggplot(aes(as.factor(batchEffect), color=method, TPR)) + 
   geom_boxplot() +
   facet_grid(.~class, space="free", scales="free") +
-  scale_color_brewer(palette="Dark2") +
-  scale_fill_brewer(palette="Dark2") +
+  scale_color_methods() +
+  scale_fill_methods() +
   theme_bw(base_size=16) +
   xlab("Batch effect magnitude") +
   theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.title.x = element_blank())
@@ -1694,43 +1388,29 @@ pl_bottom <- bind_rows(mutate(no_be, class="no Batch Effect"),
          FPR=ifelse(is.nan(FPR), 0, FPR),
          FDR=ifelse(is.nan(FDR), 0, FDR),
          Precision=ifelse(is.nan(Precision), 0, Precision)) %>%
-  filter(method != "milo_batch" & method !="louvain_batch") %>%
+  filter(method != "milo_batch" & method !="louvain_batch" & method !="cydar_batch") %>%
   ggplot(aes(as.factor(batchEffect), color=method, FDR)) + 
-  geom_boxplot() +
+  geom_boxplot(outlier.size = 0.5) +
   facet_grid(.~class, space="free", scales="free") +
-  scale_color_brewer(palette="Dark2") +
-  scale_fill_brewer(palette="Dark2") +
+  scale_color_methods() +
+  scale_fill_methods() +
   theme_bw(base_size=16) +
   xlab("Batch effect magnitude")
 
-pl_top / pl_bottom +
-  plot_layout(guides="collect")
+mnn_plot <- pl_top / pl_bottom +
+  plot_layout(guides="collect") 
+  ggsave(paste0(figdir, "batchEffect_MNNcorrected.png"), height = 5, width = 12, useDingbats=FALSE) +
+  ggsave(paste0(figdir, "batchEffect_MNNcorrected.pdf"), height = 5, width = 12, useDingbats=FALSE)
+  
+
 ```
 
-```{r}
-mnn_outcome_df %>%
-  mutate(batchEffect = as.numeric(str_remove(batchEffect, ".MNNcorrected"))) %>%
-  mutate(FDR = FP/(TP+FP)) %>%
-  mutate(TPR=ifelse(is.nan(TPR), 0, TPR),
-         FPR=ifelse(is.nan(FPR), 0, FPR),
-          FDR=ifelse(is.nan(FDR), 0, FDR),
-         Precision=ifelse(is.nan(Precision), 0, Precision)) %>%
-  rename(metric=metric) %>%
-  group_by(method, DA_thresh, batchEffect, enr) %>%
-  summarise(mean_metric=mean(metric), 
-            sd_metric=sd(metric)) %>%
-  mutate(group=paste(method, enr)) %>%
-  ggplot(aes(batchEffect, mean_metric, color=method)) +
-    geom_line() +
-  geom_ribbon(aes(ymin=mean_metric-sd_metric, ymax=mean_metric+sd_metric, fill=method), alpha=0.2, color=NA) +
-  geom_point(size=3) +
-  facet_grid(enr~., labeller="label_both") +
-  xlab("Batch effect magnitude") +
-    ylab(paste("mean", metric)) +
-    theme_bw(base_size=16) +
-  scale_color_brewer(palette="Dark2") +
-  geom_hline(yintercept = 0.8, linetype=2) +
-  scale_fill_brewer(palette="Dark2") 
+```{r, fig.height=7, fig.width=12}
+((mnn_plot & theme(legend.position = "top")) | 
+   (design_plot)
+ ) + plot_layout(widths = c(2,1.7)) +
+  ggsave(paste0(figdir, "batchEffect_MNNcorrected.png"), height = 6, width = 15) +
+  ggsave(paste0(figdir, "batchEffect_MNNcorrected.pdf"), height = 6, width = 15)
 ```
 
 
@@ -1763,7 +1443,7 @@ res %>%
 #### Linear
 
 ```{r}
-outdir <- "/nfs/team205/ed6/data/milo_benchmark/"
+outdir <- "/nfs/team205/ed6/data/milo_benchmark/linear/"
 res_files <- list.files(outdir, pattern="linear.+DAresults")
 res_files_full <- list.files(outdir, pattern="linear.+DAresults", full.names = TRUE)
 in_files <- list.files("~/data/milo_benchmark/synthetic_data/", pattern="linear.+coldata.csv")
@@ -1791,6 +1471,7 @@ linear_outcome_df <- lapply(seq_along(res_files_full), function(i){
 
 linear_outcome_df 
 ```
+
 ```{r}
 pl_df <- linear_outcome_df %>%
   filter(method!="milo_batch") %>%
@@ -1804,27 +1485,28 @@ pl_df <- linear_outcome_df %>%
   arrange(pop_size) %>%
   mutate(pop=factor(pop, levels=unique(pop))) %>%
   filter(DA_thresh >= 0.6 & batchEffect==0) 
-
 pl_right <- pl_df %>%
   ggplot(aes(method, TPR, color=method)) + 
   geom_boxplot() +
   ggbeeswarm::geom_quasirandom(alpha=0.5) +
   geom_hline(yintercept = 0.8, linetype=2) +
   theme_bw(base_size = 16) +
-  scale_color_brewer(palette="Dark2") +
-  facet_grid(enr~., labeller = 'label_both') +
-pl_df %>%
+    scale_color_methods() +
+  facet_grid(enr~., labeller = 'label_both') 
+pl_left <- pl_df %>%
   ggplot(aes(method, FDR, color=method)) + 
   geom_boxplot() +
   ggbeeswarm::geom_quasirandom(alpha=0.5) +
   geom_hline(yintercept = 0.1, linetype=2) +
   theme_bw(base_size = 16) +
-  scale_color_brewer(palette="Dark2") +
-  facet_grid(enr~., labeller = 'label_both') +
-plot_layout(guides='collect') &
-  theme(axis.text.x=element_blank())
+    scale_color_methods() +
+  facet_grid(enr~., labeller = 'label_both') 
 
-pl_right
+pl <- pl_right / pl_left +
+plot_layout(guides='collect') &
+  theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.title.x=element_blank())
+
+
 ```
 
 Plot UMAP
@@ -1835,10 +1517,11 @@ indir <- "~/data/milo_benchmark/synthetic_data/"
 names(reducedDims(linear_sce))[2] <- "umap_batch"
 colnames(reducedDims(linear_sce)[[2]]) <- c("X1", "X2") 
 
-pl_top <- plot_outcome_umap(linear_sce, method = 'milo', pop="M5", enr = 0.9, seed = 43,batchEffect = 0, true = TRUE, data_id="linear") + coord_fixed() + theme(legend.position="right")
+pl_top <- plot_outcome_umap(linear_sce, method = 'milo', pop="M5", enr = 0.9, seed = 43,batchEffect = 0, true = TRUE, data_id="linear") +
+  theme(legend.position="right") 
 
-plot_linear <- ((pl_top) / (pl_right)) +
-  plot_layout(heights = c(1,2))
+plot_linear <- ((pl_top) / (pl)) +
+  plot_layout(heights = c(1,2.5))
 plot_linear
 ```
 
@@ -1847,7 +1530,7 @@ plot_linear
 #### Branching
 
 ```{r}
-outdir <- "/nfs/team205/ed6/data/milo_benchmark/"
+outdir <- "/nfs/team205/ed6/data/milo_benchmark/branching/"
 res_files <- list.files(outdir, pattern="branching.+DAresults")
 res_files_full <- list.files(outdir, pattern="branching.+DAresults", full.names = TRUE)
 in_files <- list.files("~/data/milo_benchmark/synthetic_data/", pattern="branching.+coldata.csv")
@@ -1896,34 +1579,36 @@ pl_right <- pl_df %>%
   ggbeeswarm::geom_quasirandom(alpha=0.5) +
   geom_hline(yintercept = 0.8, linetype=2) +
   theme_bw(base_size = 16) +
-  scale_color_brewer(palette="Dark2") +
-  facet_grid(enr~., labeller = 'label_both') +
-pl_df %>%
+    scale_color_methods() +
+  facet_grid(enr~., labeller = 'label_both') 
+pl_left <- pl_df %>%
   ggplot(aes(method, FDR, color=method)) + 
   geom_boxplot() +
   ggbeeswarm::geom_quasirandom(alpha=0.5) +
   geom_hline(yintercept = 0.1, linetype=2) +
   theme_bw(base_size = 16) +
-  scale_color_brewer(palette="Dark2") +
-  facet_grid(enr~., labeller = 'label_both') +
-plot_layout(guides='collect') &
-  theme(axis.text.x=element_blank())
+    scale_color_methods() +
+  facet_grid(enr~., labeller = 'label_both') 
 
-pl_right
+pl <- pl_right / pl_left +
+plot_layout(guides='collect') &
+  theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.title.x=element_blank())
+
+
 ```
 
 Plot UMAP
-```{r, fig.width=6,fig.height=7}
+```{r, fig.height=8,fig.width=6}
 branch_sce <- readRDS("~/data/milo_benchmark/branching_data_bm.RDS")
 indir <- "~/data/milo_benchmark/synthetic_data/"
 
 names(reducedDims(branch_sce))[2] <- "umap_batch"
 colnames(reducedDims(branch_sce)[[2]]) <- c("X1", "X2") 
 
-pl_top <- plot_outcome_umap(branch_sce, method = 'milo', pop="M5", enr = 0.9, seed = 43,batchEffect = 0, true = TRUE, data_id="branching") + coord_fixed() + theme(legend.position="right")
+pl_top <- plot_outcome_umap(branch_sce, method = 'milo', pop="M5", enr = 0.9, seed = 43,batchEffect = 0, true = TRUE, data_id="branching") + theme(legend.position="right")
 
-plot_branch <- ((pl_top) / (pl_right)) +
-  plot_layout(heights = c(1,2))
+plot_branch <- ((pl_top) / (pl)) +
+  plot_layout(heights = c(1,2.5))
 plot_branch
 ```
 
@@ -1931,7 +1616,7 @@ plot_branch
 #### Simple clustering
 
 ```{r}
-outdir <- "/nfs/team205/ed6/data/milo_benchmark/"
+outdir <- "/nfs/team205/ed6/data/milo_benchmark/cluster/"
 res_files <- list.files(outdir, pattern="cluster.+DAresults")
 res_files_full <- list.files(outdir, pattern="cluster.+DAresults", full.names = TRUE)
 in_files <- list.files("~/data/milo_benchmark/synthetic_data/", pattern="cluster.+coldata.csv")
@@ -1960,6 +1645,7 @@ cluster_outcome_df <- lapply(seq_along(res_files_full), function(i){
 cluster_outcome_df 
   
 ```
+
 ```{r}
 pl_df <- cluster_outcome_df %>%
   filter(method!="milo_batch") %>%
@@ -1974,29 +1660,31 @@ pl_df <- cluster_outcome_df %>%
   mutate(pop=factor(pop, levels=unique(pop))) %>%
   filter(DA_thresh >= 0.6 & batchEffect==0) 
 
+
 pl_right <- pl_df %>%
-  ggplot(aes(method, TPR, color=method)) +
+  ggplot(aes(method, TPR, color=method)) + 
   geom_boxplot() +
   ggbeeswarm::geom_quasirandom(alpha=0.5) +
   geom_hline(yintercept = 0.8, linetype=2) +
   theme_bw(base_size = 16) +
-  scale_color_brewer(palette="Dark2") +
-  facet_grid(enr~., labeller = 'label_both') +
-pl_df %>%
+    scale_color_methods() +
+  facet_grid(enr~., labeller = 'label_both') 
+pl_left <- pl_df %>%
   ggplot(aes(method, FDR, color=method)) + 
   geom_boxplot() +
   ggbeeswarm::geom_quasirandom(alpha=0.5) +
   geom_hline(yintercept = 0.1, linetype=2) +
   theme_bw(base_size = 16) +
-  scale_color_brewer(palette="Dark2") +
-  facet_grid(enr~., labeller = 'label_both') +
-plot_layout(guides='collect') &
-  theme(axis.text.x=element_blank())
+    scale_color_methods() +
+  facet_grid(enr~., labeller = 'label_both') 
 
-pl_right
+pl <- pl_right / pl_left +
+plot_layout(guides='collect') &
+  theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.title.x=element_blank())
+
 ```
 Plot UMAP
-```{r, fig.width=14,fig.height=8}
+```{r, fig.width=8,fig.height=10}
 cluster_sce <- readRDS("~/data/milo_benchmark/cluster_data_bm.RDS")
 indir <- "~/data/milo_benchmark/synthetic_data/"
 
@@ -2004,18 +1692,23 @@ names(reducedDims(cluster_sce))[2] <- "umap_batch"
 colnames(reducedDims(cluster_sce)[[2]]) <- c("X1", "X2") 
 pl_top <- plot_outcome_umap(cluster_sce, method = 'milo', pop="3", enr = 0.9, seed = 43,batchEffect = 0, true = TRUE, data_id="cluster") + theme(legend.position="right")
 
-plot_cluster <- ((pl_top) / (pl_right)) +
-  plot_layout(heights = c(1,2))
+plot_cluster <- ((pl_top) / (pl)) +
+  plot_layout(heights = c(1,2.5))
 plot_cluster
 ```
-```{r, fig.height=8, fig.width=14}
+```{r, fig.height=10, fig.width=12}
 fig <- ((plot_cluster) & theme(legend.position="none") |
    (plot_linear) & theme(legend.position="none") |
    (plot_branch)) + 
-  plot_layout(widths=c(1,1,1))
+  plot_layout(widths=c(1,1,1)) 
 
 fig +
-  ggsave(paste0(figdir, "simData_figure.png"), width=14, height = 8)
+  ggsave(paste0(figdir, "simData_figure.png"), width=10, height = 10) +
+  ggsave(paste0(figdir, "simData_figure.pdf"), width=10, height = 10)
+```
+
+```{r}
+unique(linear_sce$celltype)
 ```
 
 
@@ -2132,6 +1825,7 @@ df <- .outcome_by_prob(cydar_res, 0.6)
 
 df
 
+
 ```
 
 
@@ -2178,5 +1872,298 @@ benchmark_df <- read_csv("/nfs/team205/ed6/data/milo_benchmark/benchmark_embryo_
 
 .outcome_by_prob(benchmark_df, 0.6)
 ```
+
+## Louvain on iterative subclustering
+
+```{r}
+plotUMAP(embryo_sce, colour_by="Condition1_prob")
+```
+
+Subcluster all celltype populations (there is a caveat here that I am not recalculating the PCA space for all subsets, but it should bring home the message regardless)
+
+```{r}
+embryo_sce$subcluster <- NA
+k=15
+
+for (pop in unique(embryo_sce$celltype)) {
+  pop_sce <- embryo_sce[,embryo_sce$celltype==pop]
+  X_red_dim <- reducedDim(pop_sce, "pca.corrected")
+  sce.graph <- buildKNNGraph(t(X_red_dim), k=k)
+  louvain.clust <- cluster_louvain(sce.graph)
+  louvain.clust.ids <- membership(louvain.clust)
+  pop_sce$subcluster <- paste(pop, as.character(louvain.clust.ids), sep="_")
+  subclusters <- setNames(pop_sce$subcluster, colnames(pop_sce))
+  colData(embryo_sce)["subcluster"][names(subclusters),] <- subclusters
+  }
+
+# pop_sce <- runUMAP(pop_sce, dimred="pca.corrected")
+subclusters_umap <- data.frame(reducedDim(embryo_sce, "UMAP")) %>%
+  mutate(subcluster=embryo_sce$subcluster) %>%
+  mutate(subcluster=factor(subcluster, levels=sample(unique(subcluster)))) %>%
+  ggplot(aes(X1, X2, color=subcluster)) +
+  geom_point(size=0.1) +
+  guides(color="none") +
+  xlab("UMAP1") + ylab("UMAP2") +
+  theme_classic(base_size=18)
+```
+
+
+Make simulated labels 
+```{r}
+embryo_sce <- add_synthetic_labels_pop(embryo_sce, pop="Somitic mesoderm", pop_column = "celltype", seed=42, pop_enr=0.8)
+true_labels <- ifelse(embryo_sce$Condition2_prob < 0.4, "NegLFC", ifelse(embryo_sce$Condition2_prob > 0.6, "PosLFC", "NotDA"))
+colData(embryo_sce)[["true_labels"]] <- true_labels
+```
+
+
+
+Testing for DA with GLM on subclusters
+
+```{r}
+condition_col = "synth_labels"
+sample_col = "synth_samples"
+
+## Make design matrix
+design_df <- as.tibble(colData(sce)[c(sample_col, condition_col)]) %>%
+    distinct() %>%
+    rename(sample=sample_col)
+design <- formula(paste('Freq ~', condition_col, "+ offset(log(N_s))", collapse = ' '))  
+
+## Test DA in subclusters
+condition_vec <- colData(embryo_sce)[[condition_col]]
+sample_labels <- colData(embryo_sce)[[sample_col]]
+clust.df <- data.frame("cell_id"=colnames(embryo_sce), "Louvain.Clust"=embryo_sce$subcluster)
+clust.df$Sample <- sample_labels
+clust.df$Condition <- condition_vec
+
+louvain.count <- table(clust.df$Louvain.Clust, clust.df$Sample)
+attributes(louvain.count)$class <- "matrix"
+  
+df <- melt(louvain.count, varnames=c("cluster", "sample"),  value.name="Freq") %>%
+    mutate(cluster=factor(cluster)) %>%
+    left_join(design_df, by="sample") %>%
+    group_by(sample) %>%
+    mutate(N_s=sum(Freq)) %>%
+    ungroup() %>%
+    group_by(cluster) %>%
+    do(model=glm(design, data=., family="poisson")) 
+  
+res_df <- t(sapply(df$model, function(x) summary(x)$coefficients[nrow(summary(x)$coefficients),]))
+colnames(res_df) <- c("logFC","Std. Error", "z value",    "Pval" )
+louvain.res <- cbind(df, res_df) %>%
+  mutate(FDR=p.adjust(Pval, method = "BH"))
+rownames(louvain.res) <- louvain.res$cluster
+  
+clust.df$logFC <- louvain.res[clust.df$Louvain.Clust, 'logFC']
+clust.df$FDR <- louvain.res[clust.df$Louvain.Clust, 'FDR']
+embryo_sce$predDA_subclusters <- louvain2output(clust.df, out_type = "labels")
+
+clust.df %>%
+  ggplot(aes(logFC, -log10(FDR))) + geom_point()
+```
+
+```{r}
+## Test DA in cell type clusters
+clust.df <- data.frame("cell_id"=colnames(embryo_sce), "Louvain.Clust"=embryo_sce$celltype)
+clust.df$Sample <- sample_labels
+clust.df$Condition <- condition_vec
+
+louvain.count <- table(clust.df$Louvain.Clust, clust.df$Sample)
+attributes(louvain.count)$class <- "matrix"
+  
+df <- melt(louvain.count, varnames=c("cluster", "sample"),  value.name="Freq") %>%
+    mutate(cluster=factor(cluster)) %>%
+    left_join(design_df, by="sample") %>%
+    group_by(sample) %>%
+    mutate(N_s=sum(Freq)) %>%
+    ungroup() %>%
+    group_by(cluster) %>%
+    do(model=glm(design, data=., family="poisson")) 
+  
+res_df <- t(sapply(df$model, function(x) summary(x)$coefficients[nrow(summary(x)$coefficients),]))
+colnames(res_df) <- c("logFC","Std. Error", "z value",    "Pval" )
+louvain.res <- cbind(df, res_df) %>%
+  mutate(FDR=p.adjust(Pval, method = "BH"))
+rownames(louvain.res) <- louvain.res$cluster
+  
+clust.df$logFC <- louvain.res[clust.df$Louvain.Clust, 'logFC']
+clust.df$FDR <- louvain.res[clust.df$Louvain.Clust, 'FDR']
+embryo_sce$predDA_celltype <- louvain2output(clust.df, out_type = "labels")
+
+clust.df %>%
+  ggplot(aes(logFC, -log10(FDR))) + geom_point()
+```
+
+```{r}
+milo_res <- run_milo(embryo_sce, condition_col="synth_labels", sample_col="synth_samples", reduced.dim = "pca.corrected",
+        k=50, d = 30)
+embryo_sce$predDA_milo <- milo2output(milo_res$Milo, milo_res$DAres, out_type = "labels")
+```
+
+
+```{r, fig.height=10, fig.width=10}
+# embryo_sce$predDA <- louvain2output(clust.df, out_type = "labels")
+
+pl_df <- data.frame(reducedDim(embryo_sce, "UMAP")) %>%
+  mutate(subcluster=embryo_sce$subcluster) %>%
+  mutate(subcluster=factor(subcluster, levels=sample(unique(subcluster)))) %>%
+  mutate(predDA_subclusters=embryo_sce$predDA_subclusters,
+         predDA_celltype=embryo_sce$predDA_celltype,
+         predDA_milo=embryo_sce$predDA_milo,
+         trueDA = embryo_sce$true_labels) 
+
+true_pl <- pl_df %>%
+  ggplot(aes(X1, X2, color=trueDA)) +
+  geom_point(size=0.1) +
+  xlab("UMAP1") + ylab("UMAP2") +
+  theme_classic(base_size=18) +
+  scale_color_manual(values=c(NotDA="grey", PosLFC="Red", NegLFC="Blue"),name="") +
+  guides(color="none") +
+  ggtitle("True DA")
+
+subcl_plot <- pl_df %>%
+  ggplot(aes(X1, X2, color=predDA_subclusters)) +
+  geom_point(size=0.1) +
+  xlab("UMAP1") + ylab("UMAP2") +
+  theme_classic(base_size=18) +
+  scale_color_manual(values=c(NotDA="grey", PosLFC="Red", NegLFC="Blue"),name="") +
+  guides(color=guide_legend(override.aes = c(size=2))) +
+  ggtitle("GLM on subclusters")
+
+cl_plot <- pl_df %>%
+  ggplot(aes(X1, X2, color=predDA_celltype)) +
+  geom_point(size=0.1) +
+  xlab("UMAP1") + ylab("UMAP2") +
+  theme_classic(base_size=18) +
+  scale_color_manual(values=c(NotDA="grey", PosLFC="Red", NegLFC="Blue"),name="") +
+  guides(color="none") +
+  ggtitle("GLM on clusters")
+
+milo_pl <- pl_df %>%
+  ggplot(aes(X1, X2, color=predDA_milo)) +
+  geom_point(size=0.1) +
+  xlab("UMAP1") + ylab("UMAP2") +
+  theme_classic(base_size=18) +
+  scale_color_manual(values=c(NotDA="grey", PosLFC="Red", NegLFC="Blue"), name="") +
+  guides(color="none") +
+  ggtitle("Milo")
+
+fig2 <- true_pl + milo_pl + cl_plot + subcl_plot +
+  plot_layout(ncol=2, nrow=2, guides="collect") 
+```
+
+
+Compare size of subclusters and size of neighbourhoods
+
+```{r}
+size_fig <- (data.frame(table(embryo_sce$subcluster)) %>%
+  ggplot(aes(Freq)) + geom_histogram() +
+  theme_classic(base_size = 16) +
+   annotate("text", label=paste0("N = ", length(unique(embryo_sce$subcluster))), x=750, y=20, size=5) +
+   xlab("Subcluster size") +
+  xlim(0, 1000)) /
+(plotNhoodSizeHist(milo_res$Milo) +
+  xlim(0, 1000) +
+   annotate("text", label=paste0("N = ", ncol(nhoods(milo_res$Milo))), x=750, y=600, size=5) +
+   xlab("Milo neighbourhood size"))
+
+size_fig
+```
+```{r, fig.width=14, fig.height=8}
+((((subclusters_umap + ggtitle("Subclusters")) /  size_fig) + plot_layout(ncol=1)) |
+   fig2 ) +
+  plot_layout(ncol=2, widths=c(1,2)) +
+  plot_annotation(tag_levels = 'A') +
+  ggsave("~/mount/gdrive/milo/Figures/RebuttalFig1_microclusters.png", width = 14, height = 8)
+```
+
+```{r}
+# subcl2true = data.frame(trueDA = embryo_sce$true_labels, subcl=embryo_sce$subcluster)
+
+clust.df %>%
+  mutate(subcl_size = table(embryo_sce$subcluster)[Louvain.Clust]) %>%
+  rename(subcl=Louvain.Clust) %>%
+  # left_join(subcl2true) %>%
+  ggplot(aes(subcl_size, -log10(FDR))) + geom_point() +
+  geom_hline(yintercept = 1)
+
+milo_res$DAres %>%
+  mutate(nh_size = colSums(nhoods(milo_res$Milo))) %>%
+  ggplot(aes(nh_size, -log10(SpatialFDR))) + geom_point() +
+  geom_hline(yintercept = 1)
+
+```
+
+```{r}
+table(milo_res$Milo$synth_labels)
+table(milo_res$Milo$synth_samples)
+
+nh_counts <- nhoodCounts(milo_res$Milo)
+
+melt(as.matrix(nh_counts), varnames=c('nh', "sample")) %>%
+  mutate(condition=str_remove(sample, "_R.+")) %>%
+  group_by(sample) %>%
+  mutate(M_s=sum(value)) %>%
+  ggplot(aes(value, group=sample, color=condition)) + geom_density()
+
+melt(as.matrix(louvain.count), varnames=c('nh', "sample")) %>%
+  mutate(condition=str_remove(sample, "_R.+")) %>%
+  group_by(sample) %>%
+  mutate(M_s=sum(value)) %>%
+  ggplot(aes(value/M_s, group=sample, color=condition)) + geom_density()
+
+```
+
+
+```{r}
+melt(as.matrix(louvain.count), varnames=c('nh', "sample")) %>%
+  mutate(condition=str_remove(sample, "_R.+")) %>%
+  group_by(nh) %>%
+  mutate(nh_size=sum(value)) %>%
+  ungroup() %>%
+  group_by(condition, nh) %>%
+  summarise(value=mean(value), nh_size=mean(nh_size)) %>%
+  pivot_wider(id_cols=c(nh, nh_size), names_from="condition", values_from='value') %>%
+  ggplot(aes(Condition1, Condition2, color=nh_size)) +
+  geom_point() +
+  geom_smooth(method="lm") +
+  geom_abline(color="red")
+```
+
+Downsample Condition1
+```{r}
+M <- table(embryo_sce$synth_samples)
+cell_ids_s <- split(colnames(embryo_sce), embryo_sce$synth_samples)
+cell_ids_s$Condition1_R1 <- sample(cell_ids_s$Condition1_R1, length(cell_ids_s$Condition2_R1))
+cell_ids_s$Condition1_R2 <- sample(cell_ids_s$Condition1_R2, length(cell_ids_s$Condition2_R2))
+cell_ids_s$Condition1_R3 <- sample(cell_ids_s$Condition1_R3, length(cell_ids_s$Condition2_R3))
+
+sce2 <- embryo_sce[,unlist(cell_ids_s)]
+
+milo2 <- Milo(sce2)
+milo2 <- buildGraph(milo2, reduced.dim = "pca.corrected", k=50, d=30)
+milo2 <- makeNhoods(milo2)
+milo2 <- miloR::countCells(milo2, meta.data = data.frame(colData(milo2)), samples = "synth_samples")
+
+nh_counts <- nhoodCounts(milo2)
+melt(as.matrix(nh_counts), varnames=c('nh', "sample")) %>%
+  mutate(condition=str_remove(sample, "_R.+")) %>%
+  group_by(sample) %>%
+  mutate(M_s=sum(value)) %>%
+  ggplot(aes(value, group=sample, color=condition)) + geom_density()
+```
+```{r}
+design_df <- as.tibble(colData(sce2)[c(sample_col, condition_col)]) %>%
+    distinct() %>%
+    column_to_rownames(sample_col)
+
+milo2 <- calcNhoodDistance(milo2, d=30, reduced.dim = "pca.corrected")
+DA_results <- testNhoods(milo2, design = ~ synth_labels, 
+                         design.df = design_df[colnames(nhoodCounts(milo2)), , drop=FALSE])
+da
+```
+
+
+
 
 

@@ -407,7 +407,7 @@ runDA <- function(sce, coldata, X_pca,
     stop(paste("Specify parameters for method", method))
   }
   ## Check valid method
-  if (!method %in% c("milo", "milo_batch", "louvain", 'daseq', "louvain_batch", 'cydar')) {
+  if (!method %in% c("milo", "milo_batch", "louvain", 'daseq', "louvain_batch", 'cydar', 'cydar_batch')) {
     stop("Unrecognized method")
   }
   

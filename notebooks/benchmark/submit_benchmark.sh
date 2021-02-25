@@ -48,10 +48,10 @@ for pop in $pops
 #                         if [ -f $output_dir/benchmark_${data_id}_pop_${pop}_enr${pop_enr}_seed${seed}_batchEffect${batch_sd}.DAresults.meld.csv ]; then
 #                                 echo "Output file exists"
 #                             else
-                                echo "python ./run_meld.py $seed $pop --pop_enrichment $pop_enr --batchEffect_sd $batch_sd --k $k --data_id $data_id" | bsub -G team283 -o ${outdir}/milo_bm_${data_id}_${seed}_meld_${pop}_${batch_sd}.out -e ${outdir}/milo_bm_${data_id}_${seed}_meld_${pop}_${batch_sd}.err -R"select[mem>3500] rusage[mem=3500]" -M3500
+#                                 echo "python ./run_meld.py $seed $pop --pop_enrichment $pop_enr --batchEffect_sd $batch_sd --k $k --data_id $data_id" | bsub -G team283 -o ${outdir}/milo_bm_${data_id}_${seed}_meld_${pop}_${batch_sd}.out -e ${outdir}/milo_bm_${data_id}_${seed}_meld_${pop}_${batch_sd}.err -R"select[mem>3500] rusage[mem=3500]" -M3500
 #                             fi
-                        for method in $R_methods
-                            do
+#                         for method in $R_methods
+#                             do
                             ## Check if outfile exists already
 #                             if [ -f $output_dir/benchmark_${data_id}_pop_${pop}_enr${pop_enr}_seed${seed}_batchEffect${batch_sd}.DAresults.${method}.csv ]; then
 #                                 echo "Output file exists"
