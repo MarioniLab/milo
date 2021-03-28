@@ -11,7 +11,7 @@ parser.add_argument("seed", help = "Seed 4 batch effect")
 parser.add_argument("pop", help = "Which cell type is DA?")
 parser.add_argument("--pop_enrichment", dest='pop_enr', default=0.7,
                     help = "Max condition probability in DA population")
-parser.add_argument("--batchEffect_sd", dest="be_sd", default=0,
+parser.add_argument("--batchEffect_sd", dest="be_sd", default='0',
                     help = "SD of batch effect")
 parser.add_argument("--k", default=50,
                     help = "K parameter")
@@ -64,7 +64,7 @@ coldata = pd.read_csv(outdir + outprefix + ".coldata.csv", index_col=0)
 
 ## Run MELD
 print("Running MELD...")
-out = run_meld(X_pca, coldata["synth_samples"], ["Condition1", "Condition2"], k=15)
+out = run_meld(X_pca, coldata["synth_samples"], ["Condition1", "Condition2"], k=args.k)
 out_df = pd.DataFrame(out["Condition2"])
 out_df.index = coldata.index
 out_df["method"] = "meld"

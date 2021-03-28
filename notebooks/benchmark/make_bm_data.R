@@ -24,6 +24,8 @@ parser$add_argument("--k", type="integer", default=50,
                     help = "K parameter")
 parser$add_argument("--data_id", type="character", default="embryo",
                     help = "ID for the dataset used")
+parser$add_argument("--make_batch_effect", type="character", default="yes",
+                    help = "should synthetic batch effects be added? (yes/no)")
 args <- parser$parse_args()
 
 seed <- args$batch_seed
@@ -32,6 +34,7 @@ k <- args$k
 pop <- args$population
 pop_enr <- args$pop_enrichment
 data_id <- args$data_id
+make_batch_effects <- args$make_batch_effect
 
 ## Load data
 print("Loading dataset...")
@@ -55,6 +58,9 @@ if (pop_enr < 0.5) {
 }
 true_labels <- ifelse(sce$Condition2_prob < da_lower, "NegLFC", ifelse(sce$Condition2_prob > da_upper, "PosLFC", "NotDA"))
 colData(sce)[["true_labels"]] <- true_labels
+if (str_detect(pop, " ")) {
+  pop <- str_replace(pop, " ", "_")
+}
 
 ## Save coldata
 outdir <-'/nfs/team205/ed6/data/milo_benchmark/synthetic_data/'
@@ -64,14 +70,18 @@ write_csv(coldata, str_c(outdir, outprefix, ".coldata.csv"))
 
 ## Simulate batch effects of different magnitude
 set.seed(seed)
-print("Simulating batch effects...")
-bm_sce_ls <- lapply(c(0, 0.25, 0.5, 0.75, 1), function(sd){
-  sce_be <- add_batch_effect(sce, batch_col = "synth_batches", norm_sd=sd)
-  # sce_be$norm_sd <- sd
-  
-  X_pca <- reducedDim(sce_be, "pca_batch")
-  
+if (make_batch_effects=="yes") {
+  print("Simulating batch effects...")
+  bm_sce_ls <- lapply(c(0, 0.25, 0.5, 0.75, 1), function(sd){
+    sce_be <- add_batch_effect(sce, batch_col = "synth_batches", norm_sd=sd)
+    
+    X_pca <- reducedDim(sce_be, "pca_batch")
+    
+    ## Save reduced dims
+    write_csv(as.data.frame(X_pca) %>% rownames_to_column(), str_c(outdir, outprefix, "_batchEffect", sd, ".pca.csv"))
+  })
+} else {
+  X_pca <- reducedDim(sce, "pca.corrected")
   ## Save reduced dims
-  write_csv(as.data.frame(X_pca) %>% rownames_to_column(), str_c(outdir, outprefix, "_batchEffect", sd, ".pca.csv"))
-})
-
+  write_csv(as.data.frame(X_pca) %>% rownames_to_column(), str_c(outdir, outprefix, "_batchEffect0.pca.csv"))
+}

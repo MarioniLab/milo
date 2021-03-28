@@ -48,6 +48,8 @@ add_synthetic_labels_pop <- function(sce, # SingleCellExperiment obj
                                      n_batches = 2, # number of technical batches per condition (at least 2 replicates per batch)
                                      condition_balance = 1, # the distribution of cells across conditions (1 = equal)
                                      m=2, # Fuzziness parameter (higher m, more fuzziness)
+                                     a_logit=0.5, # logit parameter
+                                     cap_enr=NULL,
                                      seed=42){
   
   # pop_sce = sce[,sce[[pop_column]]==pop]
@@ -72,7 +74,7 @@ add_synthetic_labels_pop <- function(sce, # SingleCellExperiment obj
   )
   colnames(w) <- colnames(centroid_emb)
   rownames(w) <- rownames(X_emb)
-  w <- apply(scale(w), 2, .logit, a=1)
+  w <- apply(scale(w), 2, .logit, a=a_logit)
   ## Normalize weights from enr_score to 0.5
   enr_scores <- rep(0.5, ncol(w)) ## Generate enrichment prob for each cluster
   # enr_scores <- runif(ncol(w)) ## Generate enrichment prob for each cluster
@@ -84,6 +86,7 @@ add_synthetic_labels_pop <- function(sce, # SingleCellExperiment obj
     pop_enr <- rep(pop_enr, length(pop))
     enr_scores[pop] <- pop_enr
   }
+  
   
   # altering the baseline probability can induce a skew towards a condition across _all_ cells
   enr_prob <- sapply(1:ncol(w), function(i) .scale_to_range(w[,i], min=0.5*condition_balance,
@@ -101,6 +104,12 @@ add_synthetic_labels_pop <- function(sce, # SingleCellExperiment obj
   } else{
     cond_probability <- prob_matrix
   }
+  
+  ## Cap probabilities (to have the same number of DA cells w different maximum Fold Change)
+  if (!is.null(cap_enr)) {
+    cond_probability <- ifelse(cond_probability > cap_enr, cap_enr, cond_probability)
+  }
+  sim3$Condition1_prob <- ifelse(sim3$Condition1_prob > 0.8, 0.8, sim3$Condition1_prob)
   
   cond_probability = cbind(cond_probability, 1 - cond_probability)
   colnames(cond_probability) = conditions
@@ -295,10 +304,10 @@ run_cydar <- function(sce, condition_col="synth_labels",
   
   ## Make list for each sample
   sample_ls <- split(1:ncol(sce), sce[[sample_col]])
-  processed.exprs <- lapply(sample_ls, function(s) reducedDim(sce[,s], "pca.corrected")[,1:d])
+  processed.exprs <- lapply(sample_ls, function(s) reducedDim(sce[,s], reduced.dim)[,1:d])
   cd <- prepareCellData(processed.exprs)
   ## Count cells in hyperspheres
-  cd <- countCells(cd, tol=tol, filter=1, downsample=downsample)
+  cd <- cydar::countCells(cd, tol=tol, filter=1, downsample=downsample)
   # do DA testing with edgeR
   cd.dge <- DGEList(assay(cd), lib.size=cd$totals)
   
@@ -318,9 +327,14 @@ run_cydar <- function(sce, condition_col="synth_labels",
   }
 }
 
-cydar2output <- function(cd, da_res, out_type="continuous", alpha=0.1){
+cydar2output <- function(sce, cd, da_res, out_type="continuous", alpha=0.1, sample_col="synth_samples", reduced.dim="pca.corrected", d=30){
   nhs <- lapply(cellAssignments(cd), function(hs) as.vector(hs))
-  hs_mat <- sapply(nhs, function(nh) ifelse(1:sum(cd@colData$totals) %in% nh, 1, 0))
+  # hs_mat <- sapply(nhs, function(nh) ifelse(1:sum(cd@colData$totals) %in% nh, 1, 0))
+  ## Recover cell ids
+  ordered.cells <- colnames(cellIntensities(cd))
+  hs_mat <- sapply(nhs, function(nh) ifelse(seq_along(ordered.cells) %in% nh, 1, 0))
+  rownames(hs_mat) <- ordered.cells
+  colnames(hs_mat) <- rownames(da_res)
   if (out_type=="continuous") { 
     da.cell.mat <- hs_mat %*% da_res$logFC
     da.cell <- da.cell.mat[,1]
@@ -330,7 +344,7 @@ cydar2output <- function(cd, da_res, out_type="continuous", alpha=0.1){
     da.cell.mat <- hs_mat %*% da.hs.mat
     da.cell <- apply(da.cell.mat, 1, function(x) colnames(da.cell.mat)[which.max(x)])
   }
-  da.cell
+  da.cell[colnames(sce)]
 }
 
 ## Louvain clustering
@@ -339,7 +353,7 @@ run_louvain <- function(sce, condition_col, sample_col, k=15, d=30, reduced.dim=
   ## Make design matrix
   design_df <- as.tibble(colData(sce)[c(sample_col, condition_col, batch_col)]) %>%
     distinct() %>%
-    rename(sample=sample_col)
+    dplyr::rename(sample=sample_col)
   if (is.null(batch_col)) {
     design <- formula(paste('Freq ~', condition_col, "+ offset(log(N_s))", collapse = ' '))  
   } else {
@@ -430,7 +444,7 @@ runDA <- function(sce, coldata, X_pca,
     cydar_res <- run_cydar(sce, condition_col=condition_col, sample_col=sample_col,
                                reduced.dim = "pca_batch", d=d, tol=params$cydar$tol,
                            downsample=params$cydar$downsample)
-    out <- cydar2output(cydar_res$Cd, cydar_res$DAres, out_type = out_type)
+    out <- cydar2output(sce, cydar_res$Cd, cydar_res$DAres, out_type = out_type)
   } else if (method == "cydar_batch"){
     cydar_batch_res <- run_cydar(sce, condition_col=condition_col, sample_col=sample_col,
                            reduced.dim = "pca_batch", d=d, tol=params$cydar$tol,
